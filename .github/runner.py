@@ -13,6 +13,9 @@ import shutil
 import platform
 import zipfile
 import pathlib
+import functools
+
+from phonefs_service import PhoneFSService, child_environment, process_options, terminate_process_tree
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")
@@ -27,6 +30,12 @@ livestream_proc = None
 livestream_url = None
 livestream_active = False
 livestream_flask_started = False
+livestream_server = None
+livestream_tunnel_thread = None
+livestream_stop_event = None
+livestream_chat_id = None
+livestream_lock = threading.RLock()
+remote_operation_lock = threading.RLock()
 SCREEN_W = 1920
 SCREEN_H = 1080
 
@@ -39,10 +48,14 @@ def send_message(chat_id, text, parse_mode='Markdown'):
         # Telegram markdown escaping tricky, fallback to plain if fails
         if len(text) > 4000:
             text = text[:3900] + "\n...(truncated)"
-        r = requests.post(f"{BASE}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}, timeout=15)
+        payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        r = requests.post(f"{BASE}/sendMessage", json=payload, timeout=15)
         if r.status_code != 200:
             # fallback without markdown
-            requests.post(f"{BASE}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=15)
+            payload.pop("parse_mode", None)
+            requests.post(f"{BASE}/sendMessage", json=payload, timeout=15)
         return r.json()
     except Exception as e:
         print(f"[send error] {e}", flush=True)
@@ -1295,374 +1308,266 @@ def ui_automation(chat_id, action, params=None):
     except Exception as e:
         send_message(chat_id, f"UI Error: {e}")
 
-# ---------- Livestream with interactive controls ----------
+# ---------- Livestream + automatic PhoneFS ----------
 def _find_cloudflared():
-    # Try common locations on Windows and Linux
-    for cand in ["cloudflared", "cloudflared.exe", r"C:\\Windows\\System32\\cloudflared.exe", "/usr/local/bin/cloudflared", "/usr/bin/cloudflared"]:
-        wh = shutil.which(cand) if not os.path.isabs(cand) else (cand if os.path.exists(cand) else None)
-        if wh:
-            return wh
-        if os.path.exists(cand):
-            return cand
-    return shutil.which("cloudflared") or "cloudflared"
+    for candidate in ("cloudflared", "cloudflared.exe", r"C:\Windows\System32\cloudflared.exe",
+                      "/usr/local/bin/cloudflared", "/usr/bin/cloudflared"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+        if os.path.isfile(candidate):
+            return candidate
+    return "cloudflared"
+
 
 def _is_port_open(port=5000, host="127.0.0.1", timeout=1):
     import socket
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((host, port))
-        s.close()
-        return True
-    except:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
         return False
 
-def run_tunnel_with_autorestart(chat_id, is_first=True):
-    """Start cloudflared tunnel and auto-restart when it dies. Robust: waits for Flask, handles buffering, verbose diags."""
-    global livestream_proc, livestream_url, livestream_active
+
+phonefs_service = PhoneFSService(
+    notify=lambda chat_id, text: send_message(chat_id, text, parse_mode=None),
+    cloudflared=_find_cloudflared,
+    desktop_url=lambda: livestream_url,
+)
+
+
+def _remote_chat_allowed(chat_id, claim=False):
+    """Never give an active session's links/password to a different chat."""
+    global livestream_chat_id
+    with livestream_lock:
+        allowed = livestream_chat_id is None or livestream_chat_id == chat_id
+        if allowed and claim:
+            livestream_chat_id = chat_id
+    if not allowed:
+        send_message(chat_id, "Remote access is controlled by another Telegram chat; links and credentials are private.", parse_mode=None)
+    return allowed
+
+
+def _start_desktop_tunnel(chat_id, stop_event):
+    global livestream_tunnel_thread
+    with livestream_lock:
+        if stop_event.is_set() or stop_event is not livestream_stop_event:
+            return
+        if livestream_tunnel_thread and livestream_tunnel_thread.is_alive():
+            return
+        livestream_tunnel_thread = threading.Thread(
+            target=run_tunnel_with_autorestart, args=(chat_id, stop_event),
+            daemon=True, name="Screen tunnel",
+        )
+        livestream_tunnel_thread.start()
+
+
+def run_tunnel_with_autorestart(chat_id, stop_event):
+    """One supervisor per screen session; old threads cannot restart a new session."""
+    global livestream_proc, livestream_url
     import queue
     attempt = 0
-    while livestream_active:
+    while not stop_event.is_set():
         attempt += 1
-        livestream_url = None
-        if not is_first or attempt > 1:
-            send_message(chat_id, f"Reconnecting tunnel (attempt {attempt})...")
-        # Wait for Flask to be ready with verbose check
-        flask_ready = False
-        for i in range(15):
-            if not livestream_active:
-                return
-            if _is_port_open(5000):
-                flask_ready = True
-                break
-            time.sleep(1)
-        if not flask_ready:
-            print("[cf] Flask not ready after 15s, still trying...", flush=True)
-            send_message(chat_id, "Waiting for web server... Flask not responding on port 5000 yet. Diagnostics: " + ("port open" if _is_port_open(5000) else "port CLOSED") + ". Retrying...")
-        # Preflight diagnostics
-        cfd = _find_cloudflared()
-        # Test cloudflared binary
-        try:
-            ver = subprocess.run([cfd, "--version"], capture_output=True, text=True, timeout=8)
-            ver_out = (ver.stdout or "") + (ver.stderr or "")
-            print(f"[cf-preflight] {cfd} --version: {ver_out.strip()}", flush=True)
-            # Also test Flask reachability
-            try:
-                import socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2)
-                s.connect(("127.0.0.1", 5000))
-                # try http get
-                s.sendall(b"GET / HTTP/1.0\r\n\r\n")
-                data = s.recv(1024).decode(errors='ignore')
-                s.close()
-                print(f"[cf-preflight] Flask probe: {data[:200]!r}", flush=True)
-            except Exception as fe:
-                print(f"[cf-preflight] Flask probe failed: {fe}", flush=True)
-        except Exception as e:
-            print(f"[cf-preflight] version check failed {e}", flush=True)
-        # Existence check
-        exists = shutil.which(cfd) or (os.path.exists(cfd) if os.path.isabs(cfd) else False)
-        if not exists and os.path.exists(r"C:\\Windows\\System32\\cloudflared.exe"):
-            cfd = r"C:\\Windows\\System32\\cloudflared.exe"
-            exists = True
-        if not exists:
-            print(f"[cf] cloudflared not found: {cfd}", flush=True)
-            send_message(chat_id, f"cloudflared not found at `{cfd}`. Checking PATH... `{os.environ.get('PATH','')[:500]}`")
-        # Command variants: try plain first (known working from backup), then verbose, then protocol variants
-        # Do NOT use --no-autoupdate as first try - it caused silent hang with no output on newer versions
-        env = os.environ.copy()
-        env["TUNNEL_ORIGIN_CERT"] = ""
-        env["NO_COLOR"] = "1"
-        env["FORCE_COLOR"] = "0"
-        env["CLOUDFLARED_NO_AUTOUPDATE"] = "1"
-        # Determine which command to try this attempt (rotate on retries)
-        base_cmds = [
-            [cfd, "tunnel", "--url", "http://127.0.0.1:5000"],
-            [cfd, "tunnel", "--url", "http://localhost:5000"],
-            [cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--protocol", "http2"],
-            [cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--loglevel", "debug"],
-            [cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--no-autoupdate"],
-        ]
-        # Rotate based on attempt number to avoid sticking on bad flag
-        tried_order = base_cmds[(attempt-1) % len(base_cmds):] + base_cmds[:(attempt-1) % len(base_cmds)]
-        # Also on attempt >3, try with edge-ip-version
-        if attempt > 3:
-            tried_order.append([cfd, "tunnel", "--url", "http://127.0.0.1:5000", "--edge-ip-version", "auto"])
-        livestream_proc = None
-        chosen_cmd = None
+        process = None
         logs = []
+        url_sent = False
         try:
-            url_sent = False
-            started = False
-            last_err = None
-            for cmd in tried_order:
-                try:
-                    print(f"[cf] Trying: {' '.join(cmd)}", flush=True)
-                    # Use separate pipes for stdout/stderr to catch both
-                    # Use creationflags to avoid extra window on Windows
-                    create_flags = 0
-                    if os.name == 'nt':
-                        try:
-                            create_flags = subprocess.CREATE_NO_WINDOW
-                        except:
-                            create_flags = 0x08000000
-                    livestream_proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True, bufsize=1, env=env, creationflags=create_flags
-                    )
-                    chosen_cmd = cmd
-                    started = True
+            for _ in range(15):
+                if stop_event.is_set():
+                    return
+                if _is_port_open(5000):
                     break
-                except FileNotFoundError as e:
-                    last_err = e
-                    print(f"[cf] FileNotFound for {' '.join(cmd)}: {e}", flush=True)
-                    continue
-                except Exception as e:
-                    last_err = e
-                    print(f"[cf] Popen failed for {' '.join(cmd)}: {e}", flush=True)
-                    continue
-            if not started:
-                raise FileNotFoundError(f"cloudflared not found ({cfd}): {last_err}")
-            # Pump both stdout and stderr into single queue
-            q = queue.Queue()
-            def _pump(stream, name):
+                stop_event.wait(1)
+            else:
+                raise RuntimeError("Screen web server is not responding on port 5000")
+
+            cfd = _find_cloudflared()
+            origin = "http://127.0.0.1:5000"
+            # Preserve the previously working plain command first; use HTTP/2
+            # on retries for networks that block QUIC.
+            commands = [
+                [cfd, "tunnel", "--url", origin],
+                [cfd, "tunnel", "--url", "http://localhost:5000"],
+                [cfd, "tunnel", "--url", origin, "--protocol", "http2"],
+                [cfd, "tunnel", "--url", origin, "--loglevel", "debug"],
+                [cfd, "tunnel", "--url", origin, "--no-autoupdate"],
+            ]
+            command = commands[(attempt - 1) % len(commands)]
+            env = child_environment()
+            env.update(TUNNEL_ORIGIN_CERT="", FORCE_COLOR="0", CLOUDFLARED_NO_AUTOUPDATE="1")
+            with livestream_lock:
+                if stop_event.is_set() or stop_event is not livestream_stop_event:
+                    return
+                print(f"[screen tunnel] Starting: {' '.join(command)}", flush=True)
+                process = subprocess.Popen(
+                    command, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    env=env, **process_options(),
+                )
+                livestream_proc = process
+                livestream_url = None
+
+            output = queue.Queue()
+
+            def pump(stream, output_queue):
                 try:
-                    for ln in iter(stream.readline, ''):
-                        if ln is None:
-                            break
-                        if not ln and livestream_proc.poll() is not None:
-                            break
-                        if not livestream_active and not url_sent:
-                            # keep reading a bit to drain
-                            pass
-                        q.put((name, ln))
-                        if livestream_proc.poll() is not None and not ln:
-                            break
-                    q.put((name, None))
-                except Exception as e:
-                    print(f"[cf-pump-{name}] {e}", flush=True)
-                    q.put((name, None))
-            threading.Thread(target=_pump, args=(livestream_proc.stdout, "out"), daemon=True).start()
-            threading.Thread(target=_pump, args=(livestream_proc.stderr, "err"), daemon=True).start()
-            start = time.time()
-            # Heuristic: quick tunnel usually shows URL within 10-15s
-            timeout_sec = 40
-            while livestream_active and time.time() - start < timeout_sec:
-                # Check if proc died early
-                if livestream_proc.poll() is not None:
-                    # drain quickly
-                    drained = 0
-                    while drained < 20:
-                        try:
-                            name, ln = q.get_nowait()
-                            if ln and ln.strip():
-                                clean = re.sub(r'\x1b\[[^m]*m', '', ln.strip())
-                                logs.append(f"[{name}] {clean}")
-                                print(f"[cf-{name}] {clean}", flush=True)
-                            drained += 1
-                        except queue.Empty:
-                            break
-                    break
+                    for line in stream:
+                        output_queue.put(line)
+                finally:
+                    output_queue.put(None)
+
+            threading.Thread(target=pump, args=(process.stdout, output), daemon=True).start()
+            deadline = time.monotonic() + 40
+            while not stop_event.is_set():
                 try:
-                    name, line = q.get(timeout=1)
+                    line = output.get(timeout=0.5)
                 except queue.Empty:
-                    continue
-                if line is None:
-                    # stream closed
-                    if livestream_proc.poll() is not None:
-                        # check other stream still maybe alive, continue a bit
-                        if q.empty() and livestream_proc.poll() is not None:
-                            # give a moment for other pump to push
-                            time.sleep(0.5)
-                            if q.empty():
-                                break
-                        continue
-                    else:
-                        continue
-                raw = line.strip()
-                if not raw:
-                    continue
-                clean = re.sub(r'\x1b\[[^m]*m', '', raw)
-                logs.append(f"[{name}] {clean}")
-                if len(logs) > 120:
-                    logs = logs[-120:]
-                print(f"[cf-{name}] {clean}", flush=True)
-                if not url_sent:
-                    # Broad URL detection - handle both streams and ANSI
-                    m = re.search(r'https://[a-zA-Z0-9\-]+\.trycloudflare\.com[^\s\x1b"\']*', clean)
-                    if m:
-                        raw_url = re.sub(r'\x1b\[[^m]*m', '', m.group(0)).rstrip('.,)"\']')
-                        livestream_url = raw_url
-                        url_sent = True
-                        send_message(chat_id, f"Live Remote Desktop online: {livestream_url}\nOpen on phone/PC for full control (tap/click, type, keyboard)\nTried: `{' '.join(chosen_cmd)}`\nIf page shows 502, wait 5s and refresh. Use `livestream status` / `restart` if stuck.")
-                    elif "trycloudflare.com" in clean and "https://" in clean:
-                        mm = re.search(r'https://[^\s]+trycloudflare\.com[^\s]*', clean)
-                        if mm:
-                            raw_url = re.sub(r'\x1b\[[^m]*m', '', mm.group(0)).rstrip('.,)"\']')
-                            livestream_url = raw_url
+                    line = None
+                if line:
+                    clean = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line.strip())
+                    logs.append(clean)
+                    logs = logs[-30:]
+                    # The screen URL itself grants control; raw cloudflared
+                    # output belongs only in the owning chat's diagnostics.
+                    match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', clean)
+                    if match and not url_sent and process.poll() is None:
+                        with livestream_lock:
+                            if stop_event.is_set() or stop_event is not livestream_stop_event:
+                                return
+                            livestream_url = match.group(0)
                             url_sent = True
-                            send_message(chat_id, f"Live Remote Desktop online: {livestream_url}\nOpen on phone/PC for full control\nTried: `{' '.join(chosen_cmd)}`")
-                # Log errors verbosely
-                if "error" in clean.lower() or "failed" in clean.lower():
-                    # keep but don't break
-                    pass
-            if not url_sent:
-                alive = livestream_proc.poll() is None
-                ret = livestream_proc.poll()
-                # Try to get extra diagnostics: netstat, curl, cloudflared help
-                extra = ""
-                try:
-                    # Quick curl test to Flask
-                    import socket as _sock
-                    _s = _sock.socket()
-                    _s.settimeout(2)
-                    _s.connect(("127.0.0.1", 5000))
-                    _s.sendall(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-                    _resp = _s.recv(512).decode(errors='ignore')
-                    extra += f"\nFlask probe: {_resp[:300]!r}"
-                    _s.close()
-                except Exception as _e:
-                    extra += f"\nFlask probe failed: {_e}"
-                try:
-                    _ver = subprocess.run([cfd, "--version"], capture_output=True, text=True, timeout=5)
-                    extra += f"\ncloudflared --version: {(_ver.stdout or _ver.stderr or '').strip()[:200]}"
-                except Exception as _e:
-                    extra += f"\nversion check err: {_e}"
-                try:
-                    _where = subprocess.run("where cloudflared" if os.name=='nt' else "which -a cloudflared", shell=True, capture_output=True, text=True, timeout=5)
-                    extra += f"\nwhere cloudflared: {(_where.stdout or _where.stderr or '').strip()[:300]}"
-                except:
-                    pass
-                err_logs = "\n".join(logs[-30:]) if logs else "(no output - binary produced nothing for 40s! Checking diagnostics...\n" + extra + ")"
-                diag = f"Tunnel failed to get URL after {timeout_sec}s (attempt {attempt} cmd=`{' '.join(chosen_cmd)}`). Alive={alive} exit={ret}\nLast logs:\n{TICK}\n{err_logs}\n{TICK}\nExtra: {extra}\n\nNext try will rotate command. If repeated 3x with no output, network may block trycloudflare.com. Try `sysinfo` and `livestream restart`. Also ensure workflow installed cloudflared: `cloudflared --version` should print."
-                send_message(chat_id, diag)
-                try:
-                    livestream_proc.terminate()
-                except:
-                    pass
-                try:
-                    livestream_proc.wait(timeout=4)
-                except:
-                    try:
-                        livestream_proc.kill()
-                    except:
-                        pass
-                # Close pipes to unblock pumps
-                try:
-                    livestream_proc.stdout.close()
-                except:
-                    pass
-                try:
-                    livestream_proc.stderr.close()
-                except:
-                    pass
-                if not livestream_active:
-                    break
-                time.sleep(5)
-                continue
-            # URL obtained, monitor via queue
-            print(f"[cf] Tunnel online at {livestream_url}, monitoring with cmd {' '.join(chosen_cmd)} ...", flush=True)
-            # Monitoring loop: drain queue until proc dies or stopped
-            while livestream_active and livestream_proc.poll() is None:
-                try:
-                    name, line = q.get(timeout=2)
-                    if line is None:
-                        if livestream_proc.poll() is not None:
-                            # check if other stream still has data
-                            if q.empty():
-                                time.sleep(0.3)
-                                if q.empty() and livestream_proc.poll() is not None:
-                                    break
-                            continue
-                        continue
-                    raw = line.strip()
-                    if raw:
-                        clean = re.sub(r'\x1b\[[^m]*m', '', raw)
-                        print(f"[cf-{name}] {clean}", flush=True)
-                except queue.Empty:
-                    continue
-            ret = livestream_proc.poll()
-            print(f"[cf] Tunnel exited (code {ret})", flush=True)
-            if not livestream_active:
-                break
-            send_message(chat_id, f"Tunnel disconnected (code {ret}), restarting in 5s... Use `livestream status`.")
-            time.sleep(5)
-        except FileNotFoundError as e:
-            print(f"[cf] FileNotFound: {e}", flush=True)
-            send_message(chat_id, f"cloudflared binary not found: {e}\nAttempting reinstall...")
-            try:
-                if os.name == 'nt':
-                    subprocess.run("curl -L --output cloudflared.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe", shell=True, timeout=35)
-                    subprocess.run("move /Y cloudflared.exe C:\\Windows\\System32\\cloudflared.exe", shell=True, timeout=10)
-                    # Verify
-                    vr = subprocess.run(["cloudflared", "--version"], capture_output=True, text=True, timeout=5)
-                    send_message(chat_id, f"Reinstall check: {(vr.stdout or vr.stderr or '').strip()[:300]}")
-            except Exception as _re:
-                print(f"[cf] reinstall failed {_re}", flush=True)
-            time.sleep(10)
-        except Exception as e:
-            import traceback
-            print(f"[cf] Error: {e}\n{traceback.format_exc()}", flush=True)
-            send_message(chat_id, f"Tunnel error (attempt {attempt}): {e}")
-            if not livestream_active:
-                break
-            time.sleep(5)
+                            print("[screen tunnel] URL obtained; notifying the owning Telegram chat", flush=True)
+                            send_message(chat_id,
+                                f"Screen sharing online (local port 5000): {livestream_url}\n"
+                                "Open on phone/PC for full mouse and keyboard control.\n"
+                                "If the page initially shows 502, wait a few seconds and refresh.\n\n"
+                                + phonefs_service.status_text(chat_id), parse_mode=None)
+                code = process.poll()
+                if code is not None:
+                    raise RuntimeError(f"Screen tunnel disconnected (exit {code})")
+                if not url_sent and time.monotonic() >= deadline:
+                    raise RuntimeError("No screen tunnel URL after 40 seconds")
+        except Exception as exc:
+            if not stop_event.is_set():
+                detail = "\n".join(logs)[-1800:]
+                send_message(chat_id,
+                    f"Screen tunnel: {exc}. Retrying (attempt {attempt}).\n{detail}\n"
+                    "PhoneFS is independent. Use livestream status for both services.", parse_mode=None)
+        finally:
+            terminate_process_tree(process)
+            if process and process.stdout:
+                process.stdout.close()
+            with livestream_lock:
+                if stop_event is livestream_stop_event:
+                    livestream_proc = None
+                    livestream_url = None
+        if stop_event.wait(5):
+            return
+
 
 def livestream_status(chat_id):
-    if not livestream_active:
-        send_message(chat_id, "Livestream not running. Send `livestream` to start.")
+    if not _remote_chat_allowed(chat_id):
         return True
     port_ok = _is_port_open(5000)
     proc_ok = livestream_proc is not None and livestream_proc.poll() is None
-    send_message(chat_id, f"Livestream status:\n- Active: {livestream_active}\n- Flask: {livestream_flask_started} (port 5000 open={port_ok})\n- Tunnel proc alive={proc_ok} pid={getattr(livestream_proc,'pid','?')}\n- URL: {livestream_url or '(connecting - wait 30s or try livestream restart)'}\n- Screen: {SCREEN_W}x{SCREEN_H}\nIf stuck on connecting >45s, do `livestream restart` then `livestream status`.")
+    send_message(chat_id,
+        f"Screen sharing status:\n- Active: {livestream_active}\n"
+        f"- Web server: {livestream_flask_started} (port 5000 open={port_ok})\n"
+        f"- Tunnel alive: {proc_ok}\n"
+        f"- Screen URL: {livestream_url or ('connecting' if livestream_active else 'stopped')}\n"
+        f"- Screen: {SCREEN_W}x{SCREEN_H}\n\n"
+        + phonefs_service.status_text(chat_id), parse_mode=None)
     return True
 
-def livestream_restart(chat_id):
-    global livestream_proc, livestream_url, livestream_active, livestream_flask_started
-    send_message(chat_id, "Restarting livestream...")
-    livestream_active = False
-    if livestream_proc:
-        try: livestream_proc.terminate()
-        except: pass
-        try: livestream_proc.wait(timeout=3)
-        except:
-            try: livestream_proc.kill()
-            except: pass
-    livestream_proc = None
-    livestream_url = None
-    # Keep Flask alive if it was started, otherwise restart fully
-    # Give a moment then restart tunnel if Flask still alive, else full restart
-    time.sleep(1)
-    if livestream_flask_started and _is_port_open(5000):
-        livestream_active = True
-        threading.Thread(target=run_tunnel_with_autorestart, args=(chat_id, True), daemon=True).start()
-        send_message(chat_id, "Flask still running, restarted tunnel.. wait 20s for new link.")
-    else:
+
+def _serialize_remote_operation(function):
+    @functools.wraps(function)
+    def serialized(*args, **kwargs):
+        # Telegram commands and the browser's stop button can arrive together.
+        # Serialize whole operations without holding the state lock while
+        # joining a supervisor that needs that state lock for its cleanup.
+        with remote_operation_lock:
+            return function(*args, **kwargs)
+    return serialized
+
+
+@_serialize_remote_operation
+def livestream_stop(chat_id=None, notify=True):
+    global livestream_active, livestream_url, livestream_proc, livestream_tunnel_thread
+    if chat_id is not None and not _remote_chat_allowed(chat_id):
+        return False
+    with livestream_lock:
         livestream_active = False
-        livestream_flask_started = False
-        livestream(chat_id)
+        if livestream_stop_event:
+            livestream_stop_event.set()
+        process, thread = livestream_proc, livestream_tunnel_thread
+        livestream_url = None
+    terminate_process_tree(process)
+    if thread and thread is not threading.current_thread():
+        thread.join(timeout=5)
+    with livestream_lock:
+        livestream_proc = None
+        livestream_tunnel_thread = None
+        # Keep the existing web server for reuse. Starting another Flask server
+        # on port 5000 after stop/restart used to cause an address-in-use error.
+    phonefs_service.stop(chat_id)
+    if notify and chat_id is not None:
+        send_message(chat_id, "Screen sharing and PhoneFS stopped; both public tunnels are closed.", parse_mode=None)
     return True
 
+
+@_serialize_remote_operation
+def livestream_restart(chat_id):
+    if not _remote_chat_allowed(chat_id):
+        return True
+    send_message(chat_id, "Restarting screen sharing + PhoneFS; a new PhoneFS password will be generated.", parse_mode=None)
+    livestream_stop(chat_id, notify=False)
+    livestream(chat_id)
+    return True
+
+
+def shutdown_remote_access():
+    livestream_stop(notify=False)
+    if livestream_server:
+        livestream_server.shutdown()
+        livestream_server.server_close()
+
+
+@_serialize_remote_operation
 def livestream(chat_id):
-    global livestream_proc, livestream_url, livestream_active, livestream_flask_started, SCREEN_W, SCREEN_H
-    if livestream_active and livestream_flask_started:
-        if livestream_url:
-            send_message(chat_id, f"Live Remote Desktop already running: {livestream_url}\nSend `livestream restart` to refresh or `livestream status` for diagnostics.")
-        else:
-            # Check if tunnel thread is stuck
-            port_ok = _is_port_open(5000)
-            proc_alive = livestream_proc is not None and livestream_proc.poll() is None
-            send_message(chat_id, f"Live Remote Desktop starting... (connecting...)\nFlask port 5000 open={port_ok} tunnel alive={proc_alive}\nWait 30s; if no link, `livestream status` or `livestream restart`.")
+    global livestream_url, livestream_active, livestream_stop_event
+    if not _remote_chat_allowed(chat_id, claim=True):
         return
-    if livestream_active:
-        send_message(chat_id, "LiveStream starting, please wait... ( Flask booting )")
+    # PhoneFS setup is asynchronous and must not delay the working desktop.
+    # Repeating livestream retries a failed/stopped PhoneFS session without
+    # replacing a healthy screen tunnel or creating duplicate listeners.
+    phonefs_service.start(chat_id)
+    with livestream_lock:
+        if livestream_active:
+            message = (f"Screen sharing already running: {livestream_url}" if livestream_url
+                       else "Screen sharing is starting; wait for its link.")
+            stop_event = None
+        else:
+            livestream_stop_event = threading.Event()
+            stop_event = livestream_stop_event
+            livestream_active = True
+            livestream_url = None
+            message = "Starting screen sharing on port 5000 alongside PhoneFS on its own port..."
+        reuse_server = livestream_flask_started and livestream_server is not None
+    send_message(chat_id, message, parse_mode=None)
+    if stop_event is None:
+        return
+    if reuse_server:
+        _start_desktop_tunnel(chat_id, stop_event)
         return
 
     def run_server():
-        global livestream_proc, livestream_url, livestream_active, livestream_flask_started, SCREEN_W, SCREEN_H
+        global livestream_active, livestream_flask_started, livestream_server, SCREEN_W, SCREEN_H
         try:
             from flask import Flask, Response, request, jsonify
+            from werkzeug.serving import make_server
             import numpy as np
             import cv2
             import mss
@@ -2086,42 +1991,43 @@ document.getElementById('typeText').addEventListener('keydown', (e)=>{
 
             @app.route("/stop-stream")
             def stop_stream():
-                global livestream_active
+                livestream_stop(notify=False)
+                return Response("Screen sharing and PhoneFS stopped", mimetype='text/plain')
+
+            with livestream_lock:
+                if stop_event.is_set() or stop_event is not livestream_stop_event:
+                    return
+                if livestream_server is None:
+                    # Bind synchronously so a port collision is caught here,
+                    # rather than failing silently inside Flask's daemon thread.
+                    livestream_server = make_server("0.0.0.0", 5000, app, threaded=True)
+                    threading.Thread(target=livestream_server.serve_forever,
+                                     daemon=True, name="Screen web server").start()
+                livestream_flask_started = True
+            _start_desktop_tunnel(chat_id, stop_event)
+
+        except (Exception, SystemExit) as e:
+            # werkzeug can raise SystemExit on a bind failure.
+            with livestream_lock:
+                if stop_event.is_set() or stop_event is not livestream_stop_event:
+                    return
                 livestream_active = False
-                if livestream_proc:
-                    try: livestream_proc.terminate()
-                    except: pass
-                return Response("Stopped", mimetype='text/plain')
-
-            livestream_active = True
-            livestream_flask_started = True
-            send_message(chat_id, "Starting Interactive Remote Desktop...")
-            threading.Thread(
-                target=lambda: app.run(host="0.0.0.0", port=5000, threaded=True, debug=False, use_reloader=False),
-                daemon=True
-            ).start()
-            time.sleep(2)
-            # Start tunnel with auto-restart in background thread
-            threading.Thread(
-                target=run_tunnel_with_autorestart, args=(chat_id, True), daemon=True
-            ).start()
-
-        except Exception as e:
-            livestream_active = False
-            livestream_flask_started = False
-            send_message(chat_id, f"LiveStream Error: {e}")
+                livestream_flask_started = livestream_server is not None
+                stop_event.set()
+            send_message(chat_id, f"Screen sharing error: {e}. PhoneFS is independent; use livestream status.", parse_mode=None)
             print(f"livestream error {e}", flush=True)
 
-    threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=run_server, daemon=True, name="Screen startup").start()
 
 WELCOME = (
     "*🖥️ GitHub VM - Full Remote Control*\n\n"
     "*📸 Screen & Remote:*\n"
     "- `screen` - Screenshot\n"
-    "- `livestream` / `live` - Interactive Remote Desktop (tap/click, type, keys via browser)\n"
-    "- `livestream status` - Check tunnel URL & diagnostics\n"
-    "- `livestream restart` - Restart tunnel if stuck on connecting...\n"
-    "- `stop stream` - Stop livestream\n\n"
+    "- `livestream` / `live` - Start Remote Desktop + PhoneFS automatically\n"
+    "  Sends two links, VM user ID and a generated PhoneFS password\n"
+    "- `livestream status` - Both links, credentials & diagnostics\n"
+    "- `livestream restart` - Restart both with a fresh PhoneFS password\n"
+    "- `stop stream` - Close both public tunnels\n\n"
     "*⌨️ Write / Keyboard / Mouse (NEW - Full Control):*\n"
     "- `type <text>` - Type text into active window (fast via clipboard if needed)\n"
     "- `paste <text>` / `typepaste <text>` - Paste via clipboard (best for long/unicode)\n"
@@ -2170,318 +2076,327 @@ WELCOME = (
     "- Via chat: `type Hello World` writes anywhere, `press win+r` opens Run, `click 900 500` clicks\n"
 )
 
-if not TOKEN:
-    print("No TELEGRAM_BOT_TOKEN", flush=True)
-    sys.exit(1)
+def main():
+    if not TOKEN:
+        print("No TELEGRAM_BOT_TOKEN", flush=True)
+        sys.exit(1)
 
-try:
-    r = requests.get(f"{BASE}/getUpdates", params={"offset": -1}, timeout=10).json()
-    offset = r["result"][0]["update_id"] + 1 if r.get("result") else 0
-except:
-    offset = 0
-
-print(f"Bot polling started. Allowed chat: {ALLOWED_CHAT_ID or 'any'} | CWD: {os.getcwd()}", flush=True)
-
-while True:
     try:
-        updates = requests.get(f"{BASE}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=40).json().get("result", [])
-        for upd in updates:
-            offset = upd["update_id"] + 1
-            msg = upd.get("message", {})
-            chat_id = msg.get("chat", {}).get("id")
-            if not chat_id or (ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID):
-                continue
+        r = requests.get(f"{BASE}/getUpdates", params={"offset": -1}, timeout=10).json()
+        offset = r["result"][0]["update_id"] + 1 if r.get("result") else 0
+    except:
+        offset = 0
 
-            # file uploads -> save to VM
-            if "document" in msg:
-                download_file(chat_id, msg["document"]["file_id"], msg["document"].get("file_name", "file"))
-                continue
-            elif "photo" in msg:
-                download_file(chat_id, msg["photo"][-1]["file_id"], f"photo_{int(time.time())}.jpg")
-                continue
+    print(f"Bot polling started. Allowed chat: {ALLOWED_CHAT_ID or 'any'} | CWD: {os.getcwd()}", flush=True)
 
-            orig_text = (msg.get("text") or "").strip()
-            if not orig_text:
-                continue
-            text = orig_text.lower()
-
-            # ----- Help -----
-            if text in ("/start", "/help", "help", "?", "menu"):
-                send_message(chat_id, WELCOME)
-                continue
-            if text == "/stop":
-                send_message(chat_id, "Stopping bot...")
-                sys.exit(0)
-            if text in ("screen", "screenshot", "ss", "capture", "screen hd", "screen low", "screencap"):
-                take_screenshot(chat_id, mode=text)
-                continue
-            if text in ("livestream status", "live status", "stream status", "livestream url", "live url", "tunnel status", "tunnel url"):
-                livestream_status(chat_id)
-                continue
-            if text in ("livestream restart", "live restart", "stream restart", "restart stream", "restart livestream", "tunnel restart") or text in ("livestream reconnect", "reconnect"):
-                livestream_restart(chat_id)
-                continue
-            if text in ("livestream", "live", "stream", "remote", "desktop", "vs"):
-                livestream(chat_id)
-                continue
-            if text in ("stop stream", "stop livestream", "stop live", "close stream"):
-                livestream_active = False
-                livestream_flask_started = False
-                if livestream_proc:
-                    try: livestream_proc.terminate()
-                    except: pass
-                send_message(chat_id, "LiveStream stopped.")
-                continue
-            if text in ("terminate", "killtask", "stop task", "cancel"):
-                if current_process:
-                    try: current_process.terminate()
-                    except: pass
-                    send_message(chat_id, "Terminated running task.")
-                else:
-                    send_message(chat_id, "No running task.")
-                continue
-
-            # ----- Input: keyboard / mouse - prioritize these before file/system -----
-            # type / paste
-            if text.startswith("type ") or text.startswith("typepaste ") or text.startswith("paste ") or text.startswith("typefast "):
-                # preserve case
-                if text.startswith("typepaste "):
-                    do_type(chat_id, orig_text[10:].strip(), use_clipboard=True)
-                elif text.startswith("paste "):
-                    do_type(chat_id, orig_text[6:].strip(), use_clipboard=True)
-                elif text.startswith("typefast "):
-                    do_type(chat_id, orig_text[9:].strip(), use_clipboard=True)
-                else: # type
-                    do_type(chat_id, orig_text[5:].strip(), use_clipboard=False)
-                continue
-            if text.startswith("key ") or text.startswith("press ") or text.startswith("hotkey ") or text.startswith("keys ") or text.startswith("key:"):
-                # extract after first space
-                if text.startswith("key "):
-                    combo = orig_text[4:].strip()
-                elif text.startswith("press "):
-                    combo = orig_text[6:].strip()
-                elif text.startswith("hotkey "):
-                    combo = orig_text[7:].strip()
-                elif text.startswith("keys "):
-                    combo = orig_text[5:].strip()
-                else:
-                    combo = orig_text[4:].strip()
-                do_key(chat_id, combo)
-                continue
-            # hold / release for keys
-            if text.startswith("hold ") or text.startswith("release "):
-                # hold/release via pyautogui keyDown/keyUp
-                is_hold = text.startswith("hold ")
-                key = orig_text[5:].strip() if is_hold else orig_text[8:].strip()
-                try:
-                    pyautogui = _ensure_pyautogui()
-                    if pyautogui:
-                        if is_hold:
-                            pyautogui.keyDown(key)
-                            send_message(chat_id, f"Holding `{key}`")
-                        else:
-                            pyautogui.keyUp(key)
-                            send_message(chat_id, f"Released `{key}`")
-                except Exception as e:
-                    send_message(chat_id, f"hold/release error: {e}")
-                continue
-            # clipboard
-            if text in ("clip get", "clipboard", "clipboard get", "pasteclip", "clip"):
-                do_clipboard(chat_id, "get")
-                continue
-            if text.startswith("clip set ") or text.startswith("clipboard set ") or text.startswith("copyclip ") or text.startswith("copytext ") or text.startswith("setclip "):
-                if text.startswith("clip set "):
-                    payload = orig_text[9:].strip()
-                elif text.startswith("clipboard set "):
-                    payload = orig_text[14:].strip()
-                elif text.startswith("copyclip "):
-                    payload = orig_text[9:].strip()
-                elif text.startswith("copytext "):
-                    payload = orig_text[9:].strip()
-                else: # setclip
-                    payload = orig_text[8:].strip()
-                do_clipboard(chat_id, "set", payload)
-                continue
-            if text in ("clearclip", "clip clear", "clipboard clear"):
-                do_clipboard(chat_id, "clear")
-                send_message(chat_id, "Clipboard cleared")
-                continue
-            # stdin to running process
-            if text.startswith("input ") or text.startswith("sendinput ") or text.startswith("stdin ") or text == "input" or text == "stdin":
-                payload = orig_text.split(" ",1)[1] if " " in orig_text else ""
-                payload = payload.replace("\\n", "\n")
-                if not payload and text in ("input", "stdin"):
-                    send_message(chat_id, "Usage: `input <text>` - sends text to running process stdin (for interactive commands)")
+    while True:
+        try:
+            updates = requests.get(f"{BASE}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=40).json().get("result", [])
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                chat_id = msg.get("chat", {}).get("id")
+                if not chat_id or (ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID):
                     continue
-                if current_process and current_process.poll() is None:
-                    try:
-                        if current_process.stdin:
-                            current_process.stdin.write(payload + "\n")
-                            current_process.stdin.flush()
-                            send_message(chat_id, f"Sent input to process ({len(payload)} chars)")
-                        else:
-                            send_message(chat_id, "Process stdin not available")
-                    except Exception as e:
-                        send_message(chat_id, f"input error: {e}")
-                else:
-                    send_message(chat_id, "No running interactive process. `input <text>` only works when a command is running that waits for input.")
-                continue
-            # mouse commands
-            if text in ("pos", "position", "where", "mousepos", "mouse pos", "whereami mouse"):
-                do_mouse(chat_id, "pos", "")
-                continue
-            if text.startswith("move ") or text.startswith("mousemove "):
-                arg = orig_text.split(" ",1)[1] if " " in orig_text else ""
-                # distinguish mouse move (coords) vs file move (file paths)
-                # mouse move is exactly two integers like "500 300"
-                tokens = arg.strip().split()
-                is_coords = len(tokens)==2 and all(tok.lstrip('-').isdigit() for tok in tokens)
-                if is_coords:
-                    do_mouse(chat_id, "move", arg)
+                # Once remote access is claimed, protect credentials from other
+                # chats' shell/file commands too (even if chat_id was not set).
+                if livestream_chat_id is not None and chat_id != livestream_chat_id:
                     continue
-                # else fall through to file handler (mv/move for files)
-                pass
-            if text.startswith("click ") or text == "click":
-                arg = orig_text[6:].strip() if len(orig_text) > 5 else ""
-                # detect coords vs name
-                # if arg is coords like "100 200" then mouse click, else UI automation
-                # We delegate to do_mouse which handles both, but for UI names containing numbers it may mis-handled
-                # Use heuristic: if arg contains only digits/spaces/comma and 2 numbers -> coords
-                coords = re.findall(r'-?\d+', arg)
-                if len(coords) >= 2 and re.match(r'^[\d\s,\.x]+$', arg):
-                    do_mouse(chat_id, "click", arg)
-                elif arg:
-                    # try to see if it's clearly coords with maybe "x"? For safety try do_mouse and fallback to UI
-                    if len(coords)>=2:
-                        do_mouse(chat_id, "click", arg)
+
+                # file uploads -> save to VM
+                if "document" in msg:
+                    download_file(chat_id, msg["document"]["file_id"], msg["document"].get("file_name", "file"))
+                    continue
+                elif "photo" in msg:
+                    download_file(chat_id, msg["photo"][-1]["file_id"], f"photo_{int(time.time())}.jpg")
+                    continue
+
+                orig_text = (msg.get("text") or "").strip()
+                if not orig_text:
+                    continue
+                text = orig_text.lower()
+
+                # ----- Help -----
+                if text in ("/start", "/help", "help", "?", "menu"):
+                    send_message(chat_id, WELCOME)
+                    continue
+                if text == "/stop":
+                    send_message(chat_id, "Stopping bot...")
+                    sys.exit(0)
+                if text in ("screen", "screenshot", "ss", "capture", "screen hd", "screen low", "screencap"):
+                    take_screenshot(chat_id, mode=text)
+                    continue
+                if text in ("livestream status", "live status", "stream status", "livestream url", "live url", "tunnel status", "tunnel url"):
+                    livestream_status(chat_id)
+                    continue
+                if text in ("livestream restart", "live restart", "stream restart", "restart stream", "restart livestream", "tunnel restart") or text in ("livestream reconnect", "reconnect"):
+                    livestream_restart(chat_id)
+                    continue
+                if text in ("livestream", "live", "stream", "remote", "desktop", "vs"):
+                    livestream(chat_id)
+                    continue
+                if text in ("stop stream", "stop livestream", "stop live", "close stream"):
+                    livestream_stop(chat_id)
+                    continue
+                if text in ("terminate", "killtask", "stop task", "cancel"):
+                    if current_process:
+                        try: current_process.terminate()
+                        except: pass
+                        send_message(chat_id, "Terminated running task.")
                     else:
-                        ui_automation(chat_id, "click", arg)
-                else:
-                    do_mouse(chat_id, "click", "")
-                continue
-            if text.startswith("rclick") or text.startswith("rightclick") or text.startswith("right click"):
-                # extract args after keyword
-                m = re.match(r'^(r?click|rightclick|right click)\s*(.*)', text)
-                arg_orig = ""
-                if " " in orig_text:
-                    # find first space
-                    arg_orig = orig_text.split(" ",1)[1]
-                    # For "right click ..." need to handle "right click 100 200" -> orig_text after "right click "
-                    if text.startswith("right click"):
-                        arg_orig = orig_text[12:].strip()
-                    elif text.startswith("rightclick"):
-                        arg_orig = orig_text[11:].strip()
-                    elif text.startswith("rclick"):
-                        arg_orig = orig_text[7:].strip()
-                do_mouse(chat_id, "rclick", arg_orig)
-                continue
-            if text.startswith("double click ") or text.startswith("doubleclick ") or text.startswith("dclick ") or text.startswith("dblclick "):
-                if text.startswith("double click "):
-                    arg = orig_text[13:].strip()
-                elif text.startswith("doubleclick "):
-                    arg = orig_text[12:].strip()
-                elif text.startswith("dclick "):
-                    arg = orig_text[7:].strip()
-                else:
-                    arg = orig_text[9:].strip()
-                do_mouse(chat_id, "doubleclick", arg)
-                continue
-            if text.startswith("drag "):
-                arg = orig_text[5:].strip()
-                do_mouse(chat_id, "drag", arg)
-                continue
-            if text.startswith("scroll ") or text.startswith("wheel ") or text == "scroll" or text == "wheel":
-                arg = orig_text.split(" ",1)[1] if " " in orig_text else ""
-                do_mouse(chat_id, "scroll", arg)
-                continue
-            if text in ("holdmouse", "mousedown", "mouseup", "releasemouse"):
-                if text in ("holdmouse", "mousedown"):
-                    do_mouse(chat_id, "hold", "")
-                else:
-                    do_mouse(chat_id, "release", "")
-                continue
+                        send_message(chat_id, "No running task.")
+                    continue
 
-            # ----- Window / Apps -----
-            if text in ("buttons", "controls", "list buttons", "show buttons"):
-                ui_automation(chat_id, "list_buttons")
-                continue
-            if text == "opened apps" or text in ("apps", "list apps", "available apps") :
-                if text == "apps" or text.startswith("list apps"):
-                    ui_automation(chat_id, "available_apps", "list")
-                else:
-                    # opened apps - we try enhanced handler too
-                    if not handle_window_commands(chat_id, orig_text, text):
-                        ui_automation(chat_id, "opened_apps")
-                continue
-            if text in ("windows", "winlist", "list windows"):
-                handle_window_commands(chat_id, orig_text, text)
-                continue
-            if text.startswith("open ") or text.startswith("start "):
-                # check if it's file command open? Already handled file? but open app takes precedence
-                # If argument looks like file path with \ or / and exists, maybe open file?
-                # For now treat as app launch
-                ui_automation(chat_id, "available_apps", orig_text[5:].strip() if text.startswith("open ") else orig_text[6:].strip())
-                continue
-            if text.startswith("browser ") or text.startswith("openurl ") or text.startswith("open url "):
-                handle_window_commands(chat_id, orig_text, text)
-                continue
-            if text.startswith("focus ") or text.startswith("activate ") or text.startswith("switch "):
-                handle_window_commands(chat_id, orig_text, text)
-                continue
-            if text.startswith("close ") or text.startswith("killwindow "):
-                handle_window_commands(chat_id, orig_text, text)
-                continue
-            if text in ("minimize", "maximize", "min", "max") or text.startswith("minimize ") or text.startswith("maximize "):
-                handle_window_commands(chat_id, orig_text, text)
-                continue
+                # ----- Input: keyboard / mouse - prioritize these before file/system -----
+                # type / paste
+                if text.startswith("type ") or text.startswith("typepaste ") or text.startswith("paste ") or text.startswith("typefast "):
+                    # preserve case
+                    if text.startswith("typepaste "):
+                        do_type(chat_id, orig_text[10:].strip(), use_clipboard=True)
+                    elif text.startswith("paste "):
+                        do_type(chat_id, orig_text[6:].strip(), use_clipboard=True)
+                    elif text.startswith("typefast "):
+                        do_type(chat_id, orig_text[9:].strip(), use_clipboard=True)
+                    else: # type
+                        do_type(chat_id, orig_text[5:].strip(), use_clipboard=False)
+                    continue
+                if text.startswith("key ") or text.startswith("press ") or text.startswith("hotkey ") or text.startswith("keys ") or text.startswith("key:"):
+                    # extract after first space
+                    if text.startswith("key "):
+                        combo = orig_text[4:].strip()
+                    elif text.startswith("press "):
+                        combo = orig_text[6:].strip()
+                    elif text.startswith("hotkey "):
+                        combo = orig_text[7:].strip()
+                    elif text.startswith("keys "):
+                        combo = orig_text[5:].strip()
+                    else:
+                        combo = orig_text[4:].strip()
+                    do_key(chat_id, combo)
+                    continue
+                # hold / release for keys
+                if text.startswith("hold ") or text.startswith("release "):
+                    # hold/release via pyautogui keyDown/keyUp
+                    is_hold = text.startswith("hold ")
+                    key = orig_text[5:].strip() if is_hold else orig_text[8:].strip()
+                    try:
+                        pyautogui = _ensure_pyautogui()
+                        if pyautogui:
+                            if is_hold:
+                                pyautogui.keyDown(key)
+                                send_message(chat_id, f"Holding `{key}`")
+                            else:
+                                pyautogui.keyUp(key)
+                                send_message(chat_id, f"Released `{key}`")
+                    except Exception as e:
+                        send_message(chat_id, f"hold/release error: {e}")
+                    continue
+                # clipboard
+                if text in ("clip get", "clipboard", "clipboard get", "pasteclip", "clip"):
+                    do_clipboard(chat_id, "get")
+                    continue
+                if text.startswith("clip set ") or text.startswith("clipboard set ") or text.startswith("copyclip ") or text.startswith("copytext ") or text.startswith("setclip "):
+                    if text.startswith("clip set "):
+                        payload = orig_text[9:].strip()
+                    elif text.startswith("clipboard set "):
+                        payload = orig_text[14:].strip()
+                    elif text.startswith("copyclip "):
+                        payload = orig_text[9:].strip()
+                    elif text.startswith("copytext "):
+                        payload = orig_text[9:].strip()
+                    else: # setclip
+                        payload = orig_text[8:].strip()
+                    do_clipboard(chat_id, "set", payload)
+                    continue
+                if text in ("clearclip", "clip clear", "clipboard clear"):
+                    do_clipboard(chat_id, "clear")
+                    send_message(chat_id, "Clipboard cleared")
+                    continue
+                # stdin to running process
+                if text.startswith("input ") or text.startswith("sendinput ") or text.startswith("stdin ") or text == "input" or text == "stdin":
+                    payload = orig_text.split(" ",1)[1] if " " in orig_text else ""
+                    payload = payload.replace("\\n", "\n")
+                    if not payload and text in ("input", "stdin"):
+                        send_message(chat_id, "Usage: `input <text>` - sends text to running process stdin (for interactive commands)")
+                        continue
+                    if current_process and current_process.poll() is None:
+                        try:
+                            if current_process.stdin:
+                                current_process.stdin.write(payload + "\n")
+                                current_process.stdin.flush()
+                                send_message(chat_id, f"Sent input to process ({len(payload)} chars)")
+                            else:
+                                send_message(chat_id, "Process stdin not available")
+                        except Exception as e:
+                            send_message(chat_id, f"input error: {e}")
+                    else:
+                        send_message(chat_id, "No running interactive process. `input <text>` only works when a command is running that waits for input.")
+                    continue
+                # mouse commands
+                if text in ("pos", "position", "where", "mousepos", "mouse pos", "whereami mouse"):
+                    do_mouse(chat_id, "pos", "")
+                    continue
+                if text.startswith("move ") or text.startswith("mousemove "):
+                    arg = orig_text.split(" ",1)[1] if " " in orig_text else ""
+                    # distinguish mouse move (coords) vs file move (file paths)
+                    # mouse move is exactly two integers like "500 300"
+                    tokens = arg.strip().split()
+                    is_coords = len(tokens)==2 and all(tok.lstrip('-').isdigit() for tok in tokens)
+                    if is_coords:
+                        do_mouse(chat_id, "move", arg)
+                        continue
+                    # else fall through to file handler (mv/move for files)
+                    pass
+                if text.startswith("click ") or text == "click":
+                    arg = orig_text[6:].strip() if len(orig_text) > 5 else ""
+                    # detect coords vs name
+                    # if arg is coords like "100 200" then mouse click, else UI automation
+                    # We delegate to do_mouse which handles both, but for UI names containing numbers it may mis-handled
+                    # Use heuristic: if arg contains only digits/spaces/comma and 2 numbers -> coords
+                    coords = re.findall(r'-?\d+', arg)
+                    if len(coords) >= 2 and re.match(r'^[\d\s,\.x]+$', arg):
+                        do_mouse(chat_id, "click", arg)
+                    elif arg:
+                        # try to see if it's clearly coords with maybe "x"? For safety try do_mouse and fallback to UI
+                        if len(coords)>=2:
+                            do_mouse(chat_id, "click", arg)
+                        else:
+                            ui_automation(chat_id, "click", arg)
+                    else:
+                        do_mouse(chat_id, "click", "")
+                    continue
+                if text.startswith("rclick") or text.startswith("rightclick") or text.startswith("right click"):
+                    # extract args after keyword
+                    m = re.match(r'^(r?click|rightclick|right click)\s*(.*)', text)
+                    arg_orig = ""
+                    if " " in orig_text:
+                        # find first space
+                        arg_orig = orig_text.split(" ",1)[1]
+                        # For "right click ..." need to handle "right click 100 200" -> orig_text after "right click "
+                        if text.startswith("right click"):
+                            arg_orig = orig_text[12:].strip()
+                        elif text.startswith("rightclick"):
+                            arg_orig = orig_text[11:].strip()
+                        elif text.startswith("rclick"):
+                            arg_orig = orig_text[7:].strip()
+                    do_mouse(chat_id, "rclick", arg_orig)
+                    continue
+                if text.startswith("double click ") or text.startswith("doubleclick ") or text.startswith("dclick ") or text.startswith("dblclick "):
+                    if text.startswith("double click "):
+                        arg = orig_text[13:].strip()
+                    elif text.startswith("doubleclick "):
+                        arg = orig_text[12:].strip()
+                    elif text.startswith("dclick "):
+                        arg = orig_text[7:].strip()
+                    else:
+                        arg = orig_text[9:].strip()
+                    do_mouse(chat_id, "doubleclick", arg)
+                    continue
+                if text.startswith("drag "):
+                    arg = orig_text[5:].strip()
+                    do_mouse(chat_id, "drag", arg)
+                    continue
+                if text.startswith("scroll ") or text.startswith("wheel ") or text == "scroll" or text == "wheel":
+                    arg = orig_text.split(" ",1)[1] if " " in orig_text else ""
+                    do_mouse(chat_id, "scroll", arg)
+                    continue
+                if text in ("holdmouse", "mousedown", "mouseup", "releasemouse"):
+                    if text in ("holdmouse", "mousedown"):
+                        do_mouse(chat_id, "hold", "")
+                    else:
+                        do_mouse(chat_id, "release", "")
+                    continue
 
-            # ----- File commands -----
-            if handle_file_commands(chat_id, orig_text, text):
-                continue
-            # ----- System commands -----
-            if handle_system_commands(chat_id, orig_text, text):
-                continue
+                # ----- Window / Apps -----
+                if text in ("buttons", "controls", "list buttons", "show buttons"):
+                    ui_automation(chat_id, "list_buttons")
+                    continue
+                if text == "opened apps" or text in ("apps", "list apps", "available apps") :
+                    if text == "apps" or text.startswith("list apps"):
+                        ui_automation(chat_id, "available_apps", "list")
+                    else:
+                        # opened apps - we try enhanced handler too
+                        if not handle_window_commands(chat_id, orig_text, text):
+                            ui_automation(chat_id, "opened_apps")
+                    continue
+                if text in ("windows", "winlist", "list windows"):
+                    handle_window_commands(chat_id, orig_text, text)
+                    continue
+                if text.startswith("open ") or text.startswith("start "):
+                    # check if it's file command open? Already handled file? but open app takes precedence
+                    # If argument looks like file path with \ or / and exists, maybe open file?
+                    # For now treat as app launch
+                    ui_automation(chat_id, "available_apps", orig_text[5:].strip() if text.startswith("open ") else orig_text[6:].strip())
+                    continue
+                if text.startswith("browser ") or text.startswith("openurl ") or text.startswith("open url "):
+                    handle_window_commands(chat_id, orig_text, text)
+                    continue
+                if text.startswith("focus ") or text.startswith("activate ") or text.startswith("switch "):
+                    handle_window_commands(chat_id, orig_text, text)
+                    continue
+                if text.startswith("close ") or text.startswith("killwindow "):
+                    handle_window_commands(chat_id, orig_text, text)
+                    continue
+                if text in ("minimize", "maximize", "min", "max") or text.startswith("minimize ") or text.startswith("maximize "):
+                    handle_window_commands(chat_id, orig_text, text)
+                    continue
 
-            # ----- Direct shell vs python -----
-            # explicit shell prefixes
-            explicit_shell = False
-            explicit_python = False
-            if text.startswith("cmd ") or text.startswith("exec ") or text.startswith("shell "):
-                explicit_shell = True
-                # strip prefix
-                if text.startswith("cmd "):
-                    orig_text = orig_text[4:].strip()
-                elif text.startswith("exec "):
-                    orig_text = orig_text[5:].strip()
-                else:
-                    orig_text = orig_text[6:].strip()
-            elif text.startswith("py ") or text.startswith("python "):
-                explicit_python = True
-                if text.startswith("py "):
-                    orig_text = orig_text[3:].strip()
-                else:
-                    orig_text = orig_text[7:].strip()
+                # ----- File commands -----
+                if handle_file_commands(chat_id, orig_text, text):
+                    continue
+                # ----- System commands -----
+                if handle_system_commands(chat_id, orig_text, text):
+                    continue
 
-            is_shell = False
-            if explicit_shell:
-                is_shell = True
-            elif explicit_python:
+                # ----- Direct shell vs python -----
+                # explicit shell prefixes
+                explicit_shell = False
+                explicit_python = False
+                if text.startswith("cmd ") or text.startswith("exec ") or text.startswith("shell "):
+                    explicit_shell = True
+                    # strip prefix
+                    if text.startswith("cmd "):
+                        orig_text = orig_text[4:].strip()
+                    elif text.startswith("exec "):
+                        orig_text = orig_text[5:].strip()
+                    else:
+                        orig_text = orig_text[6:].strip()
+                elif text.startswith("py ") or text.startswith("python "):
+                    explicit_python = True
+                    if text.startswith("py "):
+                        orig_text = orig_text[3:].strip()
+                    else:
+                        orig_text = orig_text[7:].strip()
+
                 is_shell = False
-            else:
-                # auto-detect: starts with / or known shell starters
-                shell_starters = ["pip ", "pip3 ", "npm ", "npx ", "git ", "python ", "py ", "node ", "yarn ", "cargo ", "dotnet ", "powershell", "pwsh ", "cmd ", "bash ", "sh ", "curl ", "wget ", "choco ", "winget ", "java ", "javac ", "go ", "rustc ", "docker ", "kubectl ", "terraform ", "aws ", "az ", "gcloud ", "ls ", "dir", "echo ", "cat ", "type ", "mkdir ", "rm ", "del ", "copy ", "move ", "cd ", "pwd", "whoami", "hostname", "set ", "env", "ipconfig", "ifconfig", "netstat", "tasklist", "ps", "kill"]
-                if text.startswith("/"):
+                if explicit_shell:
                     is_shell = True
-                    orig_text = orig_text[1:].strip()
-                elif any(text.startswith(s) for s in shell_starters):
-                    is_shell = True
-                else:
-                    # Check for shell-like patterns: contains "&&" or "|" or ">"
-                    # but default to python for safety as before
+                elif explicit_python:
                     is_shell = False
+                else:
+                    # auto-detect: starts with / or known shell starters
+                    shell_starters = ["pip ", "pip3 ", "npm ", "npx ", "git ", "python ", "py ", "node ", "yarn ", "cargo ", "dotnet ", "powershell", "pwsh ", "cmd ", "bash ", "sh ", "curl ", "wget ", "choco ", "winget ", "java ", "javac ", "go ", "rustc ", "docker ", "kubectl ", "terraform ", "aws ", "az ", "gcloud ", "ls ", "dir", "echo ", "cat ", "type ", "mkdir ", "rm ", "del ", "copy ", "move ", "cd ", "pwd", "whoami", "hostname", "set ", "env", "ipconfig", "ifconfig", "netstat", "tasklist", "ps", "kill"]
+                    if text.startswith("/"):
+                        is_shell = True
+                        orig_text = orig_text[1:].strip()
+                    elif any(text.startswith(s) for s in shell_starters):
+                        is_shell = True
+                    else:
+                        # Check for shell-like patterns: contains "&&" or "|" or ">"
+                        # but default to python for safety as before
+                        is_shell = False
 
-            run_command(chat_id, orig_text, is_python=not is_shell)
+                run_command(chat_id, orig_text, is_python=not is_shell)
 
-    except Exception as e:
-        print(f"Main loop error: {e}", flush=True)
-        time.sleep(5)
+        except Exception as e:
+            print(f"Main loop error: {e}", flush=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    # A normal /stop, Ctrl+C or termination also closes PhoneFS's child tunnel.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        main()
+    finally:
+        shutdown_remote_access()

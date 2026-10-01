@@ -19,23 +19,34 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
           pip install requests mss numpy opencv-python flask pillow uiautomation pyautogui psutil pyperclip
           python -c "import sys; print(sys.version)"
 
+      - name: Test remote-access automation
+        run: python -m unittest discover -s tests -v
+
       - name: Install Cloudflared
+        shell: pwsh
         run: |
-          curl -L --output cloudflared.exe https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe
-          move cloudflared.exe C:\Windows\System32\
-          cloudflared --version
+          $ErrorActionPreference = 'Stop'
+          $cloudflared = Join-Path $env:RUNNER_TEMP 'cloudflared.exe'
+          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cloudflared
+          $env:RUNNER_TEMP | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $cloudflared --version
+          if ($LASTEXITCODE -ne 0) { throw 'cloudflared installation failed' }
+
+      - name: Prepare fixed PhoneFS Windows agent
+        continue-on-error: true # The bot can retry setup without losing screen sharing.
+        run: python .github/phonefs_service.py install
 
       - name: Start Runner
         shell: cmd
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          ALLOWED_CHAT_ID: ${{ inputs.chat_id }}
+          ALLOWED_CHAT_ID: ${{ inputs.chat_id || secrets.ALLOWED_CHAT_ID }}
         run: |
           python .github/runner.py
