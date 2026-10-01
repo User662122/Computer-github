@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+# Local PhoneFS downloads, configs and credentials must not be committed.
+.phonefs/
+phonefs-runtime/
