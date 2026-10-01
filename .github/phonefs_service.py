@@ -30,8 +30,9 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-# The pinned ZIP now lives on Google Drive (public link). The old GitHub copy
-# was deleted, so raw.githubusercontent.com and the GitHub API both 404.
+# The pinned package now lives on Google Drive (public link). The old GitHub
+# copy was deleted, so raw.githubusercontent.com and the GitHub API both 404.
+# The shared file is the generated single-file agent itself, not a ZIP.
 PACKAGE_FILE_ID = "11ZqoB5wQ0C0Ajj8MMCydDnD3OC_GEGKS"
 PACKAGE_URL = f"https://drive.google.com/uc?export=download&id={PACKAGE_FILE_ID}"
 # Google Drive serves large or virus-scanned files from a second host after a
@@ -40,8 +41,11 @@ PACKAGE_MIRROR_URLS = (
     f"https://drive.usercontent.google.com/download?export=download&id={PACKAGE_FILE_ID}",
 )
 PACKAGE_URLS = (PACKAGE_URL, *PACKAGE_MIRROR_URLS)
-PACKAGE_SHA256 = "3de33e5ce3ab75b40068e367d816a08d9e4fa5c81bc67ee003c4e684174c40fd"
+PACKAGE_SHA256 = "fb90ead072c01158a1ec08c564124a3b36bc33f9dd6a910c8c1e89924f4838e6"
 AGENT_NAME = "phonefs_win_FIXED.py"
+# CLI/API surface this service invokes; used to confirm a bare downloaded file
+# really is the PhoneFS agent before it is installed and later executed.
+AGENT_MARKERS = ("set-password", "tunnel", "/api/login")
 PREFERRED_PORTS = (8877, 8878, 8879, 8890, 8891, 8892)
 USER_AGENT = "telegram-code-runner/phonefs"
 # Bounded read: a truncated download fails the checksum instead of installing
@@ -62,29 +66,47 @@ def default_install_dir():
 
 
 def _verify_pinned(data):
-    """Refuse anything that is not byte-for-byte the pinned ZIP."""
+    """Refuse anything that is not byte-for-byte the pinned package."""
     digest = hashlib.sha256(data).hexdigest()
     if digest != PACKAGE_SHA256:
-        detail = ""
-        if data[:4] != ZIP_MAGIC:
-            detail = "; the download is not a ZIP: " + repr(data[:120])
+        detail = "; downloaded content starts with: " + repr(data[:120])
         raise RuntimeError(
-            "PhoneFS ZIP checksum mismatch; refusing to execute it "
+            "PhoneFS package checksum mismatch; refusing to execute it "
             f"(downloaded sha256={digest}, pinned={PACKAGE_SHA256}){detail}. "
             "If the file was legitimately replaced, update PACKAGE_SHA256 "
             "in .github/phonefs_service.py and re-run the workflow."
         )
 
 
-def _agent_source(archive):
-    _verify_pinned(archive)
+def _agent_from_zip(archive):
+    """Read the single named agent out of the verified ZIP; extract nothing else."""
     with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
         # Read one explicitly named file. Do not extract arbitrary ZIP paths.
         members = [info for info in bundle.infolist()
                    if PurePosixPath(info.filename).name == AGENT_NAME and not info.is_dir()]
         if len(members) != 1:
             raise RuntimeError(f"PhoneFS ZIP must contain exactly one {AGENT_NAME}")
-        source = bundle.read(members[0]).decode("utf-8")
+        return bundle.read(members[0]).decode("utf-8")
+
+
+def _agent_source(package):
+    """Accept either the pinned ZIP or the generated single-file agent itself."""
+    _verify_pinned(package)
+    if package[:4] == ZIP_MAGIC:
+        source = _agent_from_zip(package)
+    else:
+        # The Google Drive file is the generated agent script, not an archive.
+        try:
+            source = package.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                "Downloaded PhoneFS package is neither a ZIP nor a UTF-8 agent script: "
+                + str(exc)) from exc
+        missing = [marker for marker in AGENT_MARKERS if marker not in source]
+        if missing:
+            raise RuntimeError(
+                "Downloaded PhoneFS file is not the expected agent; missing: "
+                + ", ".join(missing))
     if source.count(MAILBOX_START) != 1:
         raise RuntimeError("Unexpected PhoneFS build: cannot disable the public URL mailbox safely")
     source = source.replace(MAILBOX_START, MAILBOX_DISABLED)
@@ -172,7 +194,7 @@ def _download_package(url, timeout=30):
 def install_phonefs(install_dir=None):
     """Install a checksum-verified bundle outside the checkout; reuse verified cache."""
     directory = Path(install_dir) if install_dir is not None else default_install_dir()
-    archive_path = directory / "package.zip"
+    archive_path = directory / "package.bin"
     agent_path = directory / AGENT_NAME
     with INSTALL_LOCK:
         archive = None
