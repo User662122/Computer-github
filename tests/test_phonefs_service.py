@@ -1,6 +1,7 @@
 """Offline tests: no Telegram token, Windows VM or public tunnel is required."""
 
 from contextlib import redirect_stdout
+import email.message
 import hashlib
 import io
 from pathlib import Path
@@ -12,6 +13,7 @@ import threading
 import unittest
 from unittest import mock
 import urllib.error
+from urllib.parse import urlparse
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".github"))
@@ -26,6 +28,17 @@ def make_archive(filename=pfs.AGENT_NAME, source=None):
         archive.writestr("PhoneFS_Windows_Agent (1)/phonefs/" + filename, source)
         archive.writestr("../do-not-extract.txt", "not an agent")
     return output.getvalue()
+
+
+class _DriveResponse(io.BytesIO):
+    """Minimal urllib-style response: bytes plus optional Set-Cookie headers."""
+
+    def __init__(self, data, set_cookie=None):
+        super().__init__(data)
+        headers = email.message.Message()
+        if set_cookie:
+            headers["Set-Cookie"] = set_cookie
+        self.headers = headers
 
 
 class InstallerTests(unittest.TestCase):
@@ -48,13 +61,53 @@ class InstallerTests(unittest.TestCase):
         self.assertCountEqual((p.name for p in self.directory.iterdir()),
                               [pfs.AGENT_NAME, "package.zip"])
 
-    def test_raw_download_can_fall_back_to_github_api(self):
+    def test_download_can_fall_back_to_the_drive_mirror(self):
         with mock.patch.object(pfs.urllib.request, "urlopen", side_effect=[
-            urllib.error.URLError("raw host unavailable"), io.BytesIO(self.archive),
+            urllib.error.URLError("drive host unavailable"), io.BytesIO(self.archive),
         ]) as download:
             pfs.install_phonefs(self.directory)
         self.assertEqual(download.call_args_list[0].args[0].full_url, pfs.PACKAGE_URL)
-        self.assertEqual(download.call_args_list[1].args[0].full_url, pfs.PACKAGE_API_URL)
+        self.assertEqual(download.call_args_list[1].args[0].full_url, pfs.PACKAGE_MIRROR_URLS[0])
+
+    def test_package_urls_point_at_google_drive_not_github(self):
+        self.assertIn(pfs.PACKAGE_FILE_ID, pfs.PACKAGE_URL)
+        for url in pfs.PACKAGE_URLS:
+            self.assertIn(pfs.PACKAGE_FILE_ID, url)
+            self.assertTrue(urlparse(url).netloc.endswith("google.com"), url)
+            self.assertNotIn("github", url)
+
+    def test_confirmation_page_is_followed_and_cookies_are_forwarded(self):
+        interstitial = (
+            "<!DOCTYPE html><html><form id=\"download-form\" "
+            "action=\"https://drive.usercontent.google.com/download\" method=\"post\">"
+            "<input type=\"hidden\" name=\"id\" value=\"" + pfs.PACKAGE_FILE_ID + "\">"
+            "<input type=\"hidden\" name=\"export\" value=\"download\">"
+            "<input type=\"hidden\" name=\"confirm\" value=\"secret-token\">"
+            "<input type=\"hidden\" name=\"uuid\" value=\"abc-123\">"
+            "</form></html>"
+        ).encode()
+
+        def urlopen(request, timeout=None):
+            if "confirm=" in request.full_url:
+                self.assertEqual(request.headers["Cookie"],
+                                 f"download_warning_{pfs.PACKAGE_FILE_ID}=secret-token")
+                self.assertIn("confirm=secret-token", request.full_url)
+                self.assertIn("uuid=abc-123", request.full_url)
+                return _DriveResponse(self.archive)
+            return _DriveResponse(interstitial,
+                                  set_cookie=f"download_warning_{pfs.PACKAGE_FILE_ID}=secret-token")
+
+        with mock.patch.object(pfs.urllib.request, "urlopen", side_effect=urlopen):
+            agent = pfs.install_phonefs(self.directory)
+        self.assertEqual(agent.name, pfs.AGENT_NAME)
+
+    def test_unresolvable_confirmation_page_fails_closed_without_installing(self):
+        page = b"<!DOCTYPE html><html><body>Too many users have downloaded this file recently.</body></html>"
+        with mock.patch.object(pfs.urllib.request, "urlopen",
+                               side_effect=lambda request, timeout=None: _DriveResponse(page)):
+            with self.assertRaisesRegex(RuntimeError, "Could not download the pinned PhoneFS ZIP"):
+                pfs.install_phonefs(self.directory)
+        self.assertEqual(list(self.directory.iterdir()), [])
 
     def test_checksum_mismatch_never_installs_or_executes(self):
         with mock.patch.object(pfs.urllib.request, "urlopen", return_value=io.BytesIO(b"untrusted")):

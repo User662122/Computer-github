@@ -1,7 +1,8 @@
 """Unattended, Telegram-owned PhoneFS sessions for the Windows runner.
 
-Download the user's pinned ZIP, not the setup BAT's unrelated fallback URL.
-Only the fixed agent is installed; passwords/configuration are per session.
+Download the user's pinned ZIP from Google Drive (the GitHub copy was removed),
+not the setup BAT's unrelated fallback URL. Only the fixed agent is installed;
+passwords/configuration are per session.
 """
 
 import argparse
@@ -25,21 +26,28 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
-PACKAGE_REF = "af3e6a305e6387fc869800709e9264bf2a949d0c"
-PACKAGE_PATH = "PhoneFS%20fixed%20Windows_Agent%20.zip"
-PACKAGE_URL = (
-    f"https://raw.githubusercontent.com/User662122/Reddit-user/{PACKAGE_REF}/{PACKAGE_PATH}"
+# The pinned ZIP now lives on Google Drive (public link). The old GitHub copy
+# was deleted, so raw.githubusercontent.com and the GitHub API both 404.
+PACKAGE_FILE_ID = "11ZqoB5wQ0C0Ajj8MMCydDnD3OC_GEGKS"
+PACKAGE_URL = f"https://drive.google.com/uc?export=download&id={PACKAGE_FILE_ID}"
+# Google Drive serves large or virus-scanned files from a second host after a
+# one-time confirmation step; it is the same file id, used as a mirror.
+PACKAGE_MIRROR_URLS = (
+    f"https://drive.usercontent.google.com/download?export=download&id={PACKAGE_FILE_ID}",
 )
-PACKAGE_API_URL = (
-    "https://api.github.com/repos/User662122/Reddit-user/contents/"
-    f"{PACKAGE_PATH}?ref={PACKAGE_REF}"
-)
+PACKAGE_URLS = (PACKAGE_URL, *PACKAGE_MIRROR_URLS)
 PACKAGE_SHA256 = "3de33e5ce3ab75b40068e367d816a08d9e4fa5c81bc67ee003c4e684174c40fd"
 AGENT_NAME = "phonefs_win_FIXED.py"
 PREFERRED_PORTS = (8877, 8878, 8879, 8890, 8891, 8892)
+USER_AGENT = "telegram-code-runner/phonefs"
+# Bounded read: a truncated download fails the checksum instead of installing
+# a partial archive. The pinned ZIP is far smaller than this cap.
+MAX_PACKAGE_BYTES = 32 * 1024 * 1024
+ZIP_MAGIC = b"PK\x03\x04"
 URL_RE = re.compile(r"https://[a-z0-9][a-z0-9-]{0,62}\.trycloudflare\.com", re.I)
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 INSTALL_LOCK = threading.Lock()
@@ -53,9 +61,23 @@ def default_install_dir():
     return Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()) / "telegram-code-runner" / "phonefs"
 
 
+def _verify_pinned(data):
+    """Refuse anything that is not byte-for-byte the pinned ZIP."""
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != PACKAGE_SHA256:
+        detail = ""
+        if data[:4] != ZIP_MAGIC:
+            detail = "; the download is not a ZIP: " + repr(data[:120])
+        raise RuntimeError(
+            "PhoneFS ZIP checksum mismatch; refusing to execute it "
+            f"(downloaded sha256={digest}, pinned={PACKAGE_SHA256}){detail}. "
+            "If the file was legitimately replaced, update PACKAGE_SHA256 "
+            "in .github/phonefs_service.py and re-run the workflow."
+        )
+
+
 def _agent_source(archive):
-    if hashlib.sha256(archive).hexdigest() != PACKAGE_SHA256:
-        raise RuntimeError("PhoneFS ZIP checksum mismatch; refusing to execute it")
+    _verify_pinned(archive)
     with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
         # Read one explicitly named file. Do not extract arbitrary ZIP paths.
         members = [info for info in bundle.infolist()
@@ -68,6 +90,83 @@ def _agent_source(archive):
     source = source.replace(MAILBOX_START, MAILBOX_DISABLED)
     compile(source, AGENT_NAME, "exec")
     return source.encode("utf-8")
+
+
+def _cookie_header(response):
+    """Collect Set-Cookie pairs so the confirmed download keeps Drive's session."""
+    headers = getattr(response, "headers", None)
+    raw = headers.get_all("Set-Cookie") if headers is not None else None
+    pairs = []
+    for cookie in raw or []:
+        pair = cookie.split(";", 1)[0].strip()
+        if pair:
+            pairs.append(pair)
+    return "; ".join(pairs) or None
+
+
+def _fetch(url, timeout, cookie=None):
+    """GET one URL; return (body, cookie header for the follow-up request)."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    if cookie:
+        headers["Cookie"] = cookie
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read(MAX_PACKAGE_BYTES + 1)
+        return data, _cookie_header(response)
+
+
+def _is_interstitial(data):
+    """True when Google Drive answered with an HTML page instead of the file."""
+    head = data[:2048].lstrip().lower()
+    return (head.startswith(b"<!doctype html") or head.startswith(b"<html")
+            or b"<form" in head or b"<input" in head)
+
+
+def _confirm_form(html):
+    """Return (action, hidden fields) of a Drive confirmation form, if present."""
+    match = re.search(r"<form[^>]*action=[\"']([^\"']+)[\"'][^>]*>", html, re.I)
+    action = match.group(1) if match else None
+    fields = {}
+    for tag in re.findall(r"<input\b[^>]*>", html, re.I):
+        name = re.search(r"\bname=[\"']([^\"']+)[\"']", tag, re.I)
+        if not name:
+            continue
+        value = re.search(r"\bvalue=[\"']([^\"']*)[\"']", tag, re.I)
+        fields[name.group(1)] = value.group(1) if value else ""
+    return action, fields
+
+
+def _confirmed_url(url, page):
+    """Build the download URL behind Drive's 'scan anyway / download anyway' page."""
+    html = page[:65536].decode("utf-8", "replace")
+    action, fields = _confirm_form(html)
+    token = fields.get("confirm")
+    if not token:
+        match = re.search(r"[?&]confirm=([^&\"'<>\s]+)", html)
+        token = match.group(1) if match else None
+    if not token:
+        return None
+    query = {"id": fields.get("id") or PACKAGE_FILE_ID, "export": "download", "confirm": token}
+    if fields.get("uuid"):
+        query["uuid"] = fields["uuid"]
+    base = urllib.parse.urljoin(url, action) if action else url
+    separator = "&" if urllib.parse.urlparse(base).query else "?"
+    return base + separator + urllib.parse.urlencode(query)
+
+
+def _download_package(url, timeout=30):
+    """Fetch the pinned ZIP from Google Drive, following its confirmation step."""
+    data, cookie = _fetch(url, timeout)
+    if data[:4] != ZIP_MAGIC and _is_interstitial(data):
+        confirmed = _confirmed_url(url, data)
+        if confirmed:
+            data, _ = _fetch(confirmed, timeout, cookie=cookie)
+        if data[:4] != ZIP_MAGIC and _is_interstitial(data):
+            raise urllib.error.URLError(
+                f"{url} kept returning a Google Drive confirmation page instead "
+                "of the PhoneFS ZIP (file may be private, rate-limited, or too "
+                "large for Drive to scan)")
+    return data
 
 
 def install_phonefs(install_dir=None):
@@ -83,17 +182,11 @@ def install_phonefs(install_dir=None):
                 archive = cached
         if archive is None:
             failures = []
-            for url in (PACKAGE_URL, PACKAGE_API_URL):
+            for url in PACKAGE_URLS:
                 try:
-                    request = urllib.request.Request(url, headers={
-                        "User-Agent": "telegram-code-runner/phonefs",
-                        "Accept": "application/vnd.github.raw+json",
-                    })
-                    with urllib.request.urlopen(request, timeout=30) as response:
-                        data = response.read(5 * 1024 * 1024 + 1)
+                    data = _download_package(url)
                     # Check *before* caching or executing downloaded code.
-                    if hashlib.sha256(data).hexdigest() != PACKAGE_SHA256:
-                        raise RuntimeError("PhoneFS ZIP checksum mismatch; refusing to execute it")
+                    _verify_pinned(data)
                     archive = data
                     break
                 except (OSError, urllib.error.URLError) as exc:
