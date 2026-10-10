@@ -239,9 +239,15 @@ def phonefs_install_dir():
     return Path(tempfile.gettempdir()) / "local-livestream" / "phonefs"
 
 
-def _agent_source(archive):
+INSTALL_LOCK = threading.Lock()
+
+
+def _agent_source(archive, strict_mailbox=True, allow_unpinned=False):
     if hashlib.sha256(archive).hexdigest() != PACKAGE_SHA256:
-        raise RuntimeError("PhoneFS ZIP checksum mismatch; refusing to execute it")
+        if not allow_unpinned:
+            raise RuntimeError("PhoneFS ZIP checksum mismatch; refusing to execute it")
+        print("[phonefs] WARNING: bundle hash differs from the pinned build; it was "
+              "explicitly supplied by you, so it is used anyway.", flush=True)
     with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
         members = [info for info in bundle.infolist()
                    if PurePosixPath(info.filename).name == AGENT_NAME and not info.is_dir()]
@@ -249,13 +255,48 @@ def _agent_source(archive):
             raise RuntimeError(f"PhoneFS ZIP must contain exactly one {AGENT_NAME}")
         source = bundle.read(members[0]).decode("utf-8")
     if source.count(MAILBOX_START) != 1:
-        raise RuntimeError("Unexpected PhoneFS build: cannot disable the public URL mailbox safely")
+        if strict_mailbox:
+            raise RuntimeError("Unexpected PhoneFS build: cannot disable the public URL mailbox safely")
+        print("[phonefs] WARNING: public URL mailbox hook not found in this build; "
+              "it could not be disabled automatically.", flush=True)
+        compile(source, AGENT_NAME, "exec")
+        return source.encode("utf-8")
     source = source.replace(MAILBOX_START, MAILBOX_DISABLED)
     compile(source, AGENT_NAME, "exec")
     return source.encode("utf-8")
 
 
-INSTALL_LOCK = threading.Lock()
+def find_local_zip():
+    """User-supplied bundle: PHONEFS_ZIP env path, or phonefs*.zip beside the script / in cwd."""
+    candidates = []
+    env_path = os.environ.get("PHONEFS_ZIP", "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+    seen = set()
+    for base in (Path(__file__).resolve().parent, Path.cwd()):
+        for pattern in ("phonefs*.zip", "PhoneFS*.zip"):
+            try:
+                for path in sorted(base.glob(pattern)):
+                    if path.is_file() and path.resolve() not in seen:
+                        seen.add(path.resolve())
+                        candidates.append(path.resolve())
+            except OSError:
+                pass
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+ZIP_DOWNLOAD_HINT = (
+    "\nNOTE: the original host repo User662122/Reddit-user no longer exists on GitHub, so the "
+    "pinned URL 404s. To fix: restore/re-upload the 'PhoneFS fixed Windows_Agent .zip' somewhere "
+    "and set PHONEFS_ZIP_URL (optionally PHONEFS_ZIP_SHA256), or place that ZIP next to this "
+    "script (or set PHONEFS_ZIP=/path/to.zip). Screen sharing works without PhoneFS."
+)
 
 
 def install_phonefs():
@@ -264,13 +305,35 @@ def install_phonefs():
     agent_path = directory / AGENT_NAME
     with INSTALL_LOCK:
         archive = None
+        pinned_verified = False
         if archive_path.is_file():
             cached = archive_path.read_bytes()
             if hashlib.sha256(cached).hexdigest() == PACKAGE_SHA256:
                 archive = cached
+                pinned_verified = True
         if archive is None:
+            # 1) A ZIP the user supplies locally (explicitly provided -> trusted).
+            local = find_local_zip()
+            if local:
+                data = local.read_bytes()
+                if hashlib.sha256(data).hexdigest() == PACKAGE_SHA256:
+                    archive, pinned_verified = data, True
+                    print(f"[phonefs] Using verified local ZIP: {local}", flush=True)
+                else:
+                    archive = data
+                    print(f"[phonefs] WARNING: using local ZIP {local} whose hash differs from "
+                          "the pinned build; it was explicitly supplied by you.", flush=True)
+        if archive is None:
+            # 2) Downloads: optional mirror override first, then the pinned URLs.
             failures = []
-            for url in (PACKAGE_URL, PACKAGE_API_URL):
+            override_url = os.environ.get("PHONEFS_ZIP_URL", "").strip()
+            override_sha = os.environ.get("PHONEFS_ZIP_SHA256", "").strip()
+            urls = []
+            if override_url:
+                urls.append((override_url, override_sha or PACKAGE_SHA256))
+            urls.append((PACKAGE_URL, PACKAGE_SHA256))
+            urls.append((PACKAGE_API_URL, PACKAGE_SHA256))
+            for url, expected_sha in urls:
                 try:
                     request = urllib.request.Request(url, headers={
                         "User-Agent": "local-livestream/phonefs",
@@ -278,15 +341,18 @@ def install_phonefs():
                     })
                     with urllib.request.urlopen(request, timeout=30) as response:
                         data = response.read(5 * 1024 * 1024 + 1)
-                    if hashlib.sha256(data).hexdigest() != PACKAGE_SHA256:
+                    if hashlib.sha256(data).hexdigest() != expected_sha:
                         raise RuntimeError("PhoneFS ZIP checksum mismatch; refusing to execute it")
                     archive = data
+                    pinned_verified = expected_sha == PACKAGE_SHA256
                     break
                 except (OSError, urllib.error.URLError) as exc:
                     failures.append(str(exc))
             if archive is None:
-                raise RuntimeError("Could not download the pinned PhoneFS ZIP: " + "; ".join(failures))
-        source = _agent_source(archive)
+                raise RuntimeError("Could not download the pinned PhoneFS ZIP: "
+                                   + "; ".join(failures) + ZIP_DOWNLOAD_HINT)
+        source = _agent_source(archive, strict_mailbox=pinned_verified,
+                               allow_unpinned=not pinned_verified)
         directory.mkdir(parents=True, exist_ok=True)
         for destination, content in ((archive_path, archive), (agent_path, source)):
             if not destination.is_file() or destination.read_bytes() != content:
