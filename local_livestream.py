@@ -69,18 +69,29 @@ if ALLOWED_CHAT_ID:
 
 SCREEN_PORT = 5000                       # same as the runner
 
-PACKAGE_REF = "af3e6a305e6387fc869800709e9264bf2a949d0c"
-PACKAGE_PATH = "PhoneFS%20fixed%20Windows_Agent%20.zip"
-PACKAGE_URL = (
-    f"https://raw.githubusercontent.com/User662122/Reddit-user/{PACKAGE_REF}/{PACKAGE_PATH}"
+# The pinned package now lives on Google Drive (public link). The old GitHub
+# copy (User662122/Reddit-user) was deleted, so raw.githubusercontent.com and
+# the GitHub API both 404. The shared file is the generated single-file agent
+# itself, not a ZIP. (Same source as the fixed .github/phonefs_service.py.)
+PACKAGE_FILE_ID = "11ZqoB5wQ0C0Ajj8MMCydDnD3OC_GEGKS"
+PACKAGE_URL = f"https://drive.google.com/uc?export=download&id={PACKAGE_FILE_ID}"
+# Google Drive serves large or virus-scanned files from a second host after a
+# one-time confirmation step; it is the same file id, used as a mirror.
+PACKAGE_MIRROR_URLS = (
+    f"https://drive.usercontent.google.com/download?export=download&id={PACKAGE_FILE_ID}",
 )
-PACKAGE_API_URL = (
-    "https://api.github.com/repos/User662122/Reddit-user/contents/"
-    f"{PACKAGE_PATH}?ref={PACKAGE_REF}"
-)
-PACKAGE_SHA256 = "3de33e5ce3ab75b40068e367d816a08d9e4fa5c81bc67ee003c4e684174c40fd"
+PACKAGE_URLS = (PACKAGE_URL, *PACKAGE_MIRROR_URLS)
+PACKAGE_SHA256 = "fb90ead072c01158a1ec08c564124a3b36bc33f9dd6a910c8c1e89924f4838e6"
 AGENT_NAME = "phonefs_win_FIXED.py"
+# CLI/API surface this service invokes; used to confirm a bare downloaded file
+# really is the PhoneFS agent before it is installed and later executed.
+AGENT_MARKERS = ("set-password", "tunnel", "/api/login")
 PREFERRED_PORTS = (8877, 8878, 8879, 8890, 8891, 8892)
+USER_AGENT = "local-livestream/phonefs"
+# Bounded read: a truncated download fails the checksum instead of installing
+# a partial archive. The pinned package is far smaller than this cap.
+MAX_PACKAGE_BYTES = 32 * 1024 * 1024
+ZIP_MAGIC = b"PK\x03\x04"
 URL_RE = re.compile(r"https://[a-z0-9][a-z0-9-]{0,62}\.trycloudflare\.com", re.I)
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 # Disable the ZIP's hard-coded public Filebin announcement (same as the repo).
@@ -242,18 +253,49 @@ def phonefs_install_dir():
 INSTALL_LOCK = threading.Lock()
 
 
-def _agent_source(archive, strict_mailbox=True, allow_unpinned=False):
-    if hashlib.sha256(archive).hexdigest() != PACKAGE_SHA256:
-        if not allow_unpinned:
-            raise RuntimeError("PhoneFS ZIP checksum mismatch; refusing to execute it")
-        print("[phonefs] WARNING: bundle hash differs from the pinned build; it was "
-              "explicitly supplied by you, so it is used anyway.", flush=True)
+def _verify_pinned(data, expected_sha=None):
+    """Refuse anything that is not byte-for-byte the pinned package."""
+    expected = expected_sha or PACKAGE_SHA256
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != expected:
+        detail = "; downloaded content starts with: " + repr(data[:120])
+        raise RuntimeError(
+            "PhoneFS package checksum mismatch; refusing to execute it "
+            f"(downloaded sha256={digest}, pinned={expected}){detail}.")
+
+
+def _agent_from_zip(archive):
+    """Read the single named agent out of the verified ZIP; extract nothing else."""
     with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
         members = [info for info in bundle.infolist()
                    if PurePosixPath(info.filename).name == AGENT_NAME and not info.is_dir()]
         if len(members) != 1:
             raise RuntimeError(f"PhoneFS ZIP must contain exactly one {AGENT_NAME}")
-        source = bundle.read(members[0]).decode("utf-8")
+        return bundle.read(members[0]).decode("utf-8")
+
+
+def _agent_source(package, strict_mailbox=True, allow_unpinned=False):
+    """Accept either the pinned ZIP or the generated single-file agent itself."""
+    if hashlib.sha256(package).hexdigest() != PACKAGE_SHA256:
+        if not allow_unpinned:
+            _verify_pinned(package)
+        print("[phonefs] WARNING: bundle hash differs from the pinned build; it was "
+              "explicitly supplied by you, so it is used anyway.", flush=True)
+    if package[:4] == ZIP_MAGIC:
+        source = _agent_from_zip(package)
+    else:
+        # The Google Drive file is the generated agent script, not an archive.
+        try:
+            source = package.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                "Downloaded PhoneFS package is neither a ZIP nor a UTF-8 agent script: "
+                + str(exc)) from exc
+        missing = [marker for marker in AGENT_MARKERS if marker not in source]
+        if missing:
+            raise RuntimeError(
+                "Downloaded PhoneFS file is not the expected agent; missing: "
+                + ", ".join(missing))
     if source.count(MAILBOX_START) != 1:
         if strict_mailbox:
             raise RuntimeError("Unexpected PhoneFS build: cannot disable the public URL mailbox safely")
@@ -266,6 +308,85 @@ def _agent_source(archive, strict_mailbox=True, allow_unpinned=False):
     return source.encode("utf-8")
 
 
+def _cookie_header(response):
+    """Collect Set-Cookie pairs so the confirmed download keeps Drive's session."""
+    headers = getattr(response, "headers", None)
+    raw = headers.get_all("Set-Cookie") if headers is not None else None
+    pairs = []
+    for cookie in raw or []:
+        pair = cookie.split(";", 1)[0].strip()
+        if pair:
+            pairs.append(pair)
+    return "; ".join(pairs) or None
+
+
+def _fetch(url, timeout, cookie=None, headers=None):
+    """GET one URL; return (body, cookie header for the follow-up request)."""
+    merged = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    if headers:
+        merged.update(headers)
+    if cookie:
+        merged["Cookie"] = cookie
+    request = urllib.request.Request(url, headers=merged)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read(MAX_PACKAGE_BYTES + 1)
+        return data, _cookie_header(response)
+
+
+def _is_interstitial(data):
+    """True when Google Drive answered with an HTML page instead of the file."""
+    head = data[:2048].lstrip().lower()
+    return (head.startswith(b"<!doctype html") or head.startswith(b"<html")
+            or b"<form" in head or b"<input" in head)
+
+
+def _confirm_form(html):
+    """Return (action, hidden fields) of a Drive confirmation form, if present."""
+    match = re.search(r"<form[^>]*action=[\"']([^\"']+)[\"'][^>]*>", html, re.I)
+    action = match.group(1) if match else None
+    fields = {}
+    for tag in re.findall(r"<input\b[^>]*>", html, re.I):
+        name = re.search(r"\bname=[\"']([^\"']+)[\"']", tag, re.I)
+        if not name:
+            continue
+        value = re.search(r"\bvalue=[\"']([^\"']*)[\"']", tag, re.I)
+        fields[name.group(1)] = value.group(1) if value else ""
+    return action, fields
+
+
+def _confirmed_url(url, page):
+    """Build the download URL behind Drive's 'scan anyway / download anyway' page."""
+    html = page[:65536].decode("utf-8", "replace")
+    action, fields = _confirm_form(html)
+    token = fields.get("confirm")
+    if not token:
+        match = re.search(r"[?&]confirm=([^&\"'<>\s]+)", html)
+        token = match.group(1) if match else None
+    if not token:
+        return None
+    query = {"id": fields.get("id") or PACKAGE_FILE_ID, "export": "download", "confirm": token}
+    if fields.get("uuid"):
+        query["uuid"] = fields["uuid"]
+    base = urllib.parse.urljoin(url, action) if action else url
+    separator = "&" if urllib.parse.urlparse(base).query else "?"
+    return base + separator + urllib.parse.urlencode(query)
+
+
+def _download_package(url, timeout=30):
+    """Fetch the pinned package from Google Drive, following its confirmation step."""
+    data, cookie = _fetch(url, timeout)
+    if data[:4] != ZIP_MAGIC and _is_interstitial(data):
+        confirmed = _confirmed_url(url, data)
+        if confirmed:
+            data, _ = _fetch(confirmed, timeout, cookie=cookie)
+        if data[:4] != ZIP_MAGIC and _is_interstitial(data):
+            raise urllib.error.URLError(
+                f"{url} kept returning a Google Drive confirmation page instead "
+                "of the PhoneFS package (file may be private, rate-limited, or too "
+                "large for Drive to scan)")
+    return data
+
+
 def find_local_zip():
     """User-supplied bundle: PHONEFS_ZIP env path, or phonefs*.zip beside the script / in cwd."""
     candidates = []
@@ -274,10 +395,11 @@ def find_local_zip():
         candidates.append(Path(env_path))
     seen = set()
     for base in (Path(__file__).resolve().parent, Path.cwd()):
-        for pattern in ("phonefs*.zip", "PhoneFS*.zip"):
+        for pattern in ("phonefs*", "PhoneFS*"):
             try:
                 for path in sorted(base.glob(pattern)):
-                    if path.is_file() and path.resolve() not in seen:
+                    if path.suffix.lower() in (".zip", ".py") and path.is_file() \
+                            and path.resolve() not in seen and path.resolve() != Path(__file__).resolve():
                         seen.add(path.resolve())
                         candidates.append(path.resolve())
             except OSError:
@@ -292,16 +414,16 @@ def find_local_zip():
 
 
 ZIP_DOWNLOAD_HINT = (
-    "\nNOTE: the original host repo User662122/Reddit-user no longer exists on GitHub, so the "
-    "pinned URL 404s. To fix: restore/re-upload the 'PhoneFS fixed Windows_Agent .zip' somewhere "
-    "and set PHONEFS_ZIP_URL (optionally PHONEFS_ZIP_SHA256), or place that ZIP next to this "
-    "script (or set PHONEFS_ZIP=/path/to.zip). Screen sharing works without PhoneFS."
+    "\nNOTE: the package is expected on Google Drive (file id " + PACKAGE_FILE_ID + "). "
+    "If it 404s or is private again, restore it, or place the PhoneFS ZIP/agent file next to "
+    "this script (or set PHONEFS_ZIP=/path/to/file, or PHONEFS_ZIP_URL=... for a mirror). "
+    "Screen sharing works without PhoneFS."
 )
 
 
 def install_phonefs():
     directory = phonefs_install_dir()
-    archive_path = directory / "package.zip"
+    archive_path = directory / "package.bin"
     agent_path = directory / AGENT_NAME
     with INSTALL_LOCK:
         archive = None
@@ -312,44 +434,38 @@ def install_phonefs():
                 archive = cached
                 pinned_verified = True
         if archive is None:
-            # 1) A ZIP the user supplies locally (explicitly provided -> trusted).
+            # 1) A package the user supplies locally (explicitly provided -> trusted).
             local = find_local_zip()
             if local:
                 data = local.read_bytes()
                 if hashlib.sha256(data).hexdigest() == PACKAGE_SHA256:
                     archive, pinned_verified = data, True
-                    print(f"[phonefs] Using verified local ZIP: {local}", flush=True)
+                    print(f"[phonefs] Using verified local package: {local}", flush=True)
                 else:
                     archive = data
-                    print(f"[phonefs] WARNING: using local ZIP {local} whose hash differs from "
-                          "the pinned build; it was explicitly supplied by you.", flush=True)
+                    print(f"[phonefs] WARNING: using local package {local} whose hash differs "
+                          "from the pinned build; it was explicitly supplied by you.", flush=True)
         if archive is None:
-            # 2) Downloads: optional mirror override first, then the pinned URLs.
+            # 2) Downloads: optional mirror override first, then Google Drive.
             failures = []
             override_url = os.environ.get("PHONEFS_ZIP_URL", "").strip()
             override_sha = os.environ.get("PHONEFS_ZIP_SHA256", "").strip()
-            urls = []
+            attempts = []
             if override_url:
-                urls.append((override_url, override_sha or PACKAGE_SHA256))
-            urls.append((PACKAGE_URL, PACKAGE_SHA256))
-            urls.append((PACKAGE_API_URL, PACKAGE_SHA256))
-            for url, expected_sha in urls:
+                attempts.append((override_url, override_sha or PACKAGE_SHA256))
+            attempts.extend((url, PACKAGE_SHA256) for url in PACKAGE_URLS)
+            for url, expected_sha in attempts:
                 try:
-                    request = urllib.request.Request(url, headers={
-                        "User-Agent": "local-livestream/phonefs",
-                        "Accept": "application/vnd.github.raw+json",
-                    })
-                    with urllib.request.urlopen(request, timeout=30) as response:
-                        data = response.read(5 * 1024 * 1024 + 1)
-                    if hashlib.sha256(data).hexdigest() != expected_sha:
-                        raise RuntimeError("PhoneFS ZIP checksum mismatch; refusing to execute it")
+                    data = _download_package(url)
+                    # Check *before* caching or executing downloaded code.
+                    _verify_pinned(data, expected_sha)
                     archive = data
                     pinned_verified = expected_sha == PACKAGE_SHA256
                     break
                 except (OSError, urllib.error.URLError) as exc:
                     failures.append(str(exc))
             if archive is None:
-                raise RuntimeError("Could not download the pinned PhoneFS ZIP: "
+                raise RuntimeError("Could not download the pinned PhoneFS package: "
                                    + "; ".join(failures) + ZIP_DOWNLOAD_HINT)
         source = _agent_source(archive, strict_mailbox=pinned_verified,
                                allow_unpinned=not pinned_verified)
