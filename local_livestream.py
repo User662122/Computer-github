@@ -127,12 +127,16 @@ def send_message(chat_id, text):
         print(f"[telegram] send failed: {exc}", flush=True)
 
 
-def child_environment():
+def child_environment(extra_path=None):
     env = os.environ.copy()
     for name in ("TELEGRAM_BOT_TOKEN", "ALLOWED_CHAT_ID", "TELEGRAM_CHAT_ID",
                  "GITHUB_TOKEN", "GH_TOKEN"):
         env.pop(name, None)
     env.update(PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", NO_COLOR="1")
+    if extra_path:
+        # The PhoneFS agent resolves cloudflared via PATH itself; the GitHub
+        # workflow does the same by appending RUNNER_TEMP to GITHUB_PATH.
+        env["PATH"] = str(extra_path) + os.pathsep + env.get("PATH", "")
     return env
 
 
@@ -255,21 +259,29 @@ def cloudflared_cache_path():
 
 
 def space_free_cloudflared(cfd):
-    """The PhoneFS agent spawns cloudflared itself and breaks on paths with
-    spaces (e.g. C:\\Users\\Rohit Das\\...). Give it a space-free copy/path."""
+    """The PhoneFS agent spawns cloudflared itself and breaks on paths that
+    contain spaces (common on Windows accounts like 'Rohit Das'). Hand it a
+    space-free copy instead."""
     cfd = str(cfd)
     if " " not in cfd:
         return cfd
     if os.name == "nt":
-        try:
-            target = cloudflared_cache_path()
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.is_file() or target.stat().st_size != os.path.getsize(cfd):
-                shutil.copyfile(cfd, target)
-            print(f"[cloudflared] Using space-free copy for PhoneFS: {target}", flush=True)
-            return str(target)
-        except OSError as exc:
-            print(f"[cloudflared] Could not copy to space-free location: {exc}", flush=True)
+        drive = os.environ.get("SystemDrive") or "C:"
+        root = os.environ.get("SystemRoot") or (drive + r"\Windows")
+        name = Path(cfd).name
+        candidates = [
+            Path(drive + "\\local-livestream") / name,
+            Path(root) / "Temp" / "local-livestream" / name,
+        ]
+        for target in candidates:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.is_file() or target.stat().st_size != os.path.getsize(cfd):
+                    shutil.copyfile(cfd, target)
+                print(f"[cloudflared] Using space-free copy for PhoneFS: {target}", flush=True)
+                return str(target)
+            except OSError as exc:
+                print(f"[cloudflared] Could not copy to {target}: {exc}", flush=True)
         try:  # Fallback: NTFS 8.3 short name (e.g. ROHITD~1).
             import ctypes
             buffer = ctypes.create_unicode_buffer(512)
@@ -279,6 +291,8 @@ def space_free_cloudflared(cfd):
                     return short
         except Exception as exc:
             print(f"[cloudflared] Short-path lookup failed: {exc}", flush=True)
+        print("[cloudflared] WARNING: no space-free location worked; PhoneFS may fail "
+              "to start cloudflared.", flush=True)
     return cfd
 
 
@@ -1137,6 +1151,11 @@ def run_phonefs(chat_id):
         # The PhoneFS agent spawns cloudflared itself and breaks on paths that
         # contain spaces (e.g. C:\Users\Rohit Das\...), so hand it a space-free copy.
         cfd = space_free_cloudflared(find_cloudflared())
+        cfd_dir = str(Path(cfd).parent)
+        cfd_ok = Path(cfd).is_file()
+        print(f"[phonefs] cloudflared for agent: {cfd} (exists={cfd_ok}, on PATH={cfd_dir})", flush=True)
+        if not cfd_ok:
+            raise RuntimeError(f"cloudflared not found at {cfd}")
 
         State.pfs_config_dir = Path(tempfile.mkdtemp(prefix="session-", dir=agent.parent))
         # A fresh config directory prevents an earlier saved password from
@@ -1145,7 +1164,7 @@ def run_phonefs(chat_id):
             [sys.executable, "-u", str(agent), "--config-dir", str(State.pfs_config_dir), "set-password"],
             input=State.pfs_password + "\n", capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=30,
-            env=child_environment(), cwd=agent.parent, **process_options(),
+            env=child_environment(cfd_dir), cwd=agent.parent, **process_options(),
         )
         if result.returncode:
             detail = _redact(result.stderr or result.stdout)[-1200:]
@@ -1159,7 +1178,7 @@ def run_phonefs(chat_id):
                 State.pfs_state = "connecting"
                 State.pfs_error = None
                 State.pfs_logs.clear()
-            code, was_online = phonefs_attempt(chat_id, agent, cfd, attempt)
+            code, was_online = phonefs_attempt(chat_id, agent, cfd, attempt, cfd_dir=cfd_dir)
             if State.pfs_stop.is_set() or State.stop_all.is_set():
                 return
             with State.lock:
@@ -1194,7 +1213,7 @@ def run_phonefs(chat_id):
                 State.pfs_state = "stopped"
 
 
-def phonefs_attempt(chat_id, agent, cfd, attempt):
+def phonefs_attempt(chat_id, agent, cfd, attempt, cfd_dir=None):
     command = [sys.executable, "-u", str(agent), "--config-dir", str(State.pfs_config_dir),
                "tunnel", "--port", str(State.pfs_port), "--hours", "6",
                "--cloudflared", cfd, "--prefix", "", "--no-qr", "--no-pty", "--verbose"]
@@ -1207,7 +1226,7 @@ def phonefs_attempt(chat_id, agent, cfd, attempt):
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    text=True, encoding="utf-8", errors="replace", bufsize=1,
-                                   env=child_environment(), cwd=agent.parent, **process_options())
+                                   env=child_environment(cfd_dir), cwd=agent.parent, **process_options())
         State.pfs_proc = process
     print(f"[phonefs] Starting verified agent on local port {State.pfs_port}", flush=True)
 
