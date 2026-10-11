@@ -257,6 +257,40 @@ def process_options():
     return {"start_new_session": True}
 
 
+def _space_free_path(path):
+    """Return a copy of ``path`` with no spaces, for children that spawn it.
+
+    The PhoneFS agent launches cloudflared itself via a plain string, which
+    breaks on Windows accounts whose profile path contains spaces
+    (e.g. ``C:\\Users\\Rohit Das\\...`` -> WinError 2). Copying the binary to a
+    space-free directory (or using its 8.3 short name) avoids that.
+    """
+    path = str(path)
+    if " " not in path:
+        return path
+    if os.name == "nt":
+        try:
+            root = os.environ.get("SystemRoot") or r"C:\Windows"
+            target_dir = Path(root) / "Temp" / "telegram-code-runner"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / Path(path).name
+            if not target.is_file() or target.stat().st_size != os.path.getsize(path):
+                shutil.copyfile(path, target)
+            return str(target)
+        except OSError:
+            pass
+        try:
+            import ctypes
+            buffer = ctypes.create_unicode_buffer(512)
+            if ctypes.windll.kernel32.GetShortPathNameW(path, buffer, 512):
+                short = buffer.value
+                if short and " " not in short:
+                    return short
+        except Exception:
+            pass
+    return path
+
+
 def terminate_process_tree(process):
     """Stop only this service's process tree, never all cloudflared processes."""
     if process is None:
@@ -427,6 +461,9 @@ class PhoneFSService:
             cfd = self.cloudflared()
             if not (shutil.which(cfd) or Path(cfd).is_file()):
                 raise RuntimeError("cloudflared is not installed; re-run the Telegram Runner workflow")
+            # The agent spawns cloudflared itself and fails on paths containing
+            # spaces (e.g. usernames like "Rohit Das"); pass a space-free copy.
+            cfd = _space_free_path(cfd)
             session.config_dir = Path(tempfile.mkdtemp(prefix="session-", dir=agent.parent))
             # A fresh config directory prevents an earlier password from silently
             # overriding --password (the bundle only honors that flag on first run).

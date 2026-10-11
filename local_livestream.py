@@ -218,10 +218,14 @@ def find_cloudflared():
             return found
         if os.path.isfile(candidate):
             return candidate
-    cached = Path(tempfile.gettempdir()) / "local-livestream" / (
-        "cloudflared.exe" if os.name == "nt" else "cloudflared")
+    cached = cloudflared_cache_path()
     if cached.is_file():
         return str(cached)
+    # Legacy cache location (may contain spaces via the username).
+    legacy = Path(tempfile.gettempdir()) / "local-livestream" / (
+        "cloudflared.exe" if os.name == "nt" else "cloudflared")
+    if legacy.is_file():
+        return str(legacy)
     print("[cloudflared] not found; downloading (same URL as the GitHub workflow)...", flush=True)
     url = CLOUDFLARED_URLS.get((platform.system(), platform.machine()))
     if not url:
@@ -242,11 +246,52 @@ def find_cloudflared():
     return str(cached)
 
 
+def cloudflared_cache_path():
+    """A space-free cache dir: C:\\Windows\\Temp on Windows, else %TEMP%."""
+    if os.name == "nt":
+        root = os.environ.get("SystemRoot") or r"C:\Windows"
+        return Path(root) / "Temp" / "local-livestream" / "cloudflared.exe"
+    return Path(tempfile.gettempdir()) / "local-livestream" / "cloudflared"
+
+
+def space_free_cloudflared(cfd):
+    """The PhoneFS agent spawns cloudflared itself and breaks on paths with
+    spaces (e.g. C:\\Users\\Rohit Das\\...). Give it a space-free copy/path."""
+    cfd = str(cfd)
+    if " " not in cfd:
+        return cfd
+    if os.name == "nt":
+        try:
+            target = cloudflared_cache_path()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.is_file() or target.stat().st_size != os.path.getsize(cfd):
+                shutil.copyfile(cfd, target)
+            print(f"[cloudflared] Using space-free copy for PhoneFS: {target}", flush=True)
+            return str(target)
+        except OSError as exc:
+            print(f"[cloudflared] Could not copy to space-free location: {exc}", flush=True)
+        try:  # Fallback: NTFS 8.3 short name (e.g. ROHITD~1).
+            import ctypes
+            buffer = ctypes.create_unicode_buffer(512)
+            if ctypes.windll.kernel32.GetShortPathNameW(cfd, buffer, 512):
+                short = buffer.value
+                if short and " " not in short:
+                    return short
+        except Exception as exc:
+            print(f"[cloudflared] Short-path lookup failed: {exc}", flush=True)
+    return cfd
+
+
 # ----------------------------------------------------------------------------
 # PhoneFS install (identical safety model as .github/phonefs_service.py)
 # ----------------------------------------------------------------------------
 
 def phonefs_install_dir():
+    # Keep the whole PhoneFS tree on a space-free path on Windows: the agent
+    # and its child processes handle "C:\Users\Rohit DAS\..." style paths badly.
+    if os.name == "nt":
+        root = os.environ.get("SystemRoot") or r"C:\Windows"
+        return Path(root) / "Temp" / "local-livestream" / "phonefs"
     return Path(tempfile.gettempdir()) / "local-livestream" / "phonefs"
 
 
@@ -1089,7 +1134,9 @@ def run_phonefs(chat_id):
         agent = install_phonefs()
         if State.pfs_stop.is_set() or State.stop_all.is_set():
             return
-        cfd = find_cloudflared()
+        # The PhoneFS agent spawns cloudflared itself and breaks on paths that
+        # contain spaces (e.g. C:\Users\Rohit Das\...), so hand it a space-free copy.
+        cfd = space_free_cloudflared(find_cloudflared())
 
         State.pfs_config_dir = Path(tempfile.mkdtemp(prefix="session-", dir=agent.parent))
         # A fresh config directory prevents an earlier saved password from
