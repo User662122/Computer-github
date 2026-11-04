@@ -172,6 +172,11 @@ class FakePyAutoGUI:
     def moveTo(self, x, y, duration=0):
         MODEL.move_to(x, y)
 
+    def position(self):
+        x, y = MODEL.cursor
+        point = types.SimpleNamespace(x=x, y=y)
+        return point
+
     def click(self, x=None, y=None, clicks=1, interval=0.0, button="left", **kwargs):
         MODEL.click(x, y)
 
@@ -206,9 +211,14 @@ def install_stubs():
     cv2.IMWRITE_JPEG_QUALITY = 1
 
     def cvt_color(frame, code):
-        return np.asarray(frame)[:, :, :3]
+        image = np.asarray(frame)
+        if image.ndim == 3 and image.shape[2] >= 3:
+            # BGR (luma approximation is plenty for change detection)
+            return (image[:, :, 0] * 0.114 + image[:, :, 1] * 0.587 +
+                    image[:, :, 2] * 0.299).astype(np.uint8)
+        return image
 
-    def resize(frame, size):
+    def resize(frame, size, interpolation=None):
         width, height = size
         image = Image.fromarray(np.asarray(frame))
         return np.asarray(image.resize((width, height), Image.BILINEAR))
@@ -228,6 +238,9 @@ def install_stubs():
     cv2.cvtColor = cvt_color
     cv2.resize = resize
     cv2.imencode = imencode
+    cv2.COLOR_BGR2GRAY = 6
+    cv2.INTER_AREA = 3
+    cv2.IMWRITE_WEBP_QUALITY = 1
     sys.modules["cv2"] = cv2
 
     mss = types.ModuleType("mss")

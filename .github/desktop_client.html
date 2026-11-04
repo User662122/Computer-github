@@ -24,8 +24,7 @@
             touch-action:none;overscroll-behavior:none;
             -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
   #stage{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform;background:#000}
-  #screen{display:block;width:100%;height:100%;pointer-events:none;
-          user-select:none;-webkit-user-drag:none;image-rendering:auto}
+  #screen{display:block;width:100%;height:100%;pointer-events:none;user-select:none;-webkit-user-drag:none}
   #overlay{position:absolute;inset:0;pointer-events:none;display:flex;align-items:flex-start;
            justify-content:center;padding-top:6px}
   #fps{font:11px monospace;background:rgba(0,0,0,.7);color:#0f0;padding:3px 6px;border-radius:4px}
@@ -34,6 +33,7 @@
   .hint{font-size:10px;line-height:1.5;color:#8a8a8a;padding:5px 8px;text-align:center;background:#111;flex:none}
   .sep{width:1px;height:22px;background:#444;margin:0 2px}
   #modeBtn.on{border-color:#3ea6ff;color:#8fd0ff}
+  #dataBtn.on{border-color:#39c07a;color:#8ff0bb}
 </style>
 </head>
 <body>
@@ -69,11 +69,14 @@
     <button id="zoomFit" title="Fit whole desktop">Fit</button>
     <button id="zoomOne" title="Actual size">1:1</button>
     <button id="modeBtn" class="on" title="What a one-finger swipe does">Swipe: Scroll</button>
-    <button id="qualityBtn" title="Sharper live picture while zoomed in">HD: Auto</button>
+    <button id="qualityBtn" title="Picture resolution">HD: Auto</button>
+    <button id="dataBtn" title="Data saver: stop fetching when quiet">Data: Normal</button>
     <button onclick="location.reload()">↻</button>
   </div>
   <div id="viewport">
-    <div id="stage"><img id="screen" src="/snapshot" alt="desktop" draggable="false"></div>
+    <div id="stage">
+      <canvas id="screen" width="960" height="540"></canvas>
+    </div>
     <div id="overlay"><div id="fps">Live</div></div>
   </div>
   <div class="hint" id="hint">Swipe = scroll wheel • Pinch = zoom • Tap = click • Long-press = right-click • Double-tap = double-click</div>
@@ -84,40 +87,53 @@
 /* ------------------------------------------------------------------ *
  * Remote desktop client.
  *
- * Touch is NOT converted into a mouse drag any more. Mapping a swipe to
- * press-move-release on the VM selected text / dragged windows instead of
- * scrolling. Gestures are now:
- *   one finger swipe   -> mouse wheel scroll (or pan the zoomed view)
- *   two finger pinch   -> zoom the local view (not the remote screen)
- *   two finger drag    -> pan the zoomed view
- *   tap / long press   -> click / right click
- * Mouse keeps its old behaviour (click, drag to select, wheel to scroll)
- * and gains Ctrl+wheel zoom plus middle-drag panning.
+ * Transport: dirty-tile deltas (the way VNC / TeamViewer / RDP work).
+ * The server keeps one frame; it long-polls /frames for the list of
+ * rectangles that changed and fetches only those images from /tile. An
+ * idle desktop therefore transfers almost nothing instead of a full
+ * JPEG many times per second.
+ *
+ * Touch: a one-finger swipe scrolls like the mouse wheel (it never
+ * presses a button, so it cannot select text), a two-finger pinch zooms
+ * the local view, tap / long press / double tap click as expected.
  * ------------------------------------------------------------------ */
 
 var viewport = document.getElementById('viewport');
 var stage    = document.getElementById('stage');
-var img      = document.getElementById('screen');
+var canvas   = document.getElementById('screen');
+var ctx      = canvas.getContext('2d');
 var fpsEl    = document.getElementById('fps');
 var stEl     = document.getElementById('st');
 var modeBtn  = document.getElementById('modeBtn');
+var dataBtn  = document.getElementById('dataBtn');
+var qualityBtn = document.getElementById('qualityBtn');
 
 // ---- geometry -----------------------------------------------------
-var screenW = 1920, screenH = 1080;
+var screenW = 1920, screenH = 1080;     // remote desktop size
+var frameW = 960, frameH = 540;         // delta picture size
 var zoom = 1, panX = 0, panY = 0, fitScale = 1;
 
 // ---- tuning -------------------------------------------------------
-var TAP_MOVE_PX      = 12;    // finger must stay inside this to count as a tap
-var TAP_MS           = 600;   // ... and released before the long press fires
-var LONG_PRESS_MS    = 650;   // hold still this long for a right click
-var DRAG_EPS         = 4;     // mouse drag threshold
-var SWIPE_SEND_MS    = 55;    // scroll throttle
-var MIN_FIT_FACTOR   = 0.35;  // how far below "fit" the user may zoom out
+var TAP_MOVE_PX      = 12;
+var TAP_MS           = 600;
+var LONG_PRESS_MS    = 650;
+var DRAG_EPS         = 4;
+var SWIPE_SEND_MS    = 55;
+var MIN_FIT_FACTOR   = 0.35;
 var MAX_ABS_ZOOM     = 8;
-var WHEEL_LINE_PX    = 16;
+var POLL_TIMEOUT     = 20;             // long-poll seconds
+var POLL_RETRY_MS    = 400;
+var MAX_PARALLEL     = 6;              // tile requests in flight
 
-var swipeMode = 'scroll';     // 'scroll' | 'pan'
-var qualityMode = 'auto';     // 'auto' | 'high' | 'low' (live picture width)
+var swipeMode = 'scroll';              // 'scroll' | 'pan'
+var qualityMode = 'auto';              // 'auto' | 'high' | 'low'
+var dataSaver = false;                 // pause polling while the screen is idle
+var lastSeq = 0;
+var pictureReady = false;
+var pending = [];                      // rectangles waiting to be drawn
+var inFlight = 0, drawn = 0, bytesIn = 0;
+var lastDrawAt = 0, dirtySince = 0;
+var pollAbort = null;
 
 // ---- helpers ------------------------------------------------------
 function clamp(v, lo, hi){ return v < lo ? lo : (v > hi ? hi : v); }
@@ -136,7 +152,7 @@ function flash(msg){
 function computeFit(){
   var s = Math.min(vpW() / screenW, vpH() / screenH);
   if (!isFinite(s) || s <= 0) s = 1;
-  fitScale = Math.min(s, 1);          // never enlarge past actual size when fitting
+  fitScale = Math.min(s, 1);
 }
 function maxZoom(){ return clamp(Math.max(fitScale * 10, 2), 2, MAX_ABS_ZOOM); }
 function minZoom(){ return fitScale * MIN_FIT_FACTOR; }
@@ -147,40 +163,36 @@ function clampPan(){
   if (cw <= w + 0.5) panX = (w - cw) / 2; else panX = clamp(panX, w - cw, 0);
   if (ch <= h + 0.5) panY = (h - ch) / 2; else panY = clamp(panY, h - ch, 0);
 }
-
 function applyView(){
   stage.style.transform = 'translate3d(' + panX + 'px,' + panY + 'px,0) scale(' + zoom + ')';
 }
-
 function fitView(){
   computeFit();
   zoom = fitScale;
-  clampPan();                 // centres the desktop
+  clampPan();
   applyView();
 }
-
 function zoomTo(newZoom, clientX, clientY){
   newZoom = clamp(newZoom, minZoom(), maxZoom());
   if (!isFinite(newZoom) || newZoom <= 0) return;
   var r = vpRect();
   var ax = clientX - r.left, ay = clientY - r.top;
-  var dx = (ax - panX) / zoom;      // desktop point under the fingers (before zoom)
+  var dx = (ax - panX) / zoom;
   var dy = (ay - panY) / zoom;
   zoom = newZoom;
   panX = ax - dx * zoom;
   panY = ay - dy * zoom;
   clampPan();
   applyView();
-  maybeUpgradeStream();
+  maybeUpgradeQuality();
 }
-
 function zoomByStep(factor){
   var r = vpRect();
   zoomTo(zoom * factor, r.left + r.width / 2, r.top + r.height / 2);
   flash('Zoom ' + Math.round(zoom / fitScale * 100) + '%');
 }
 
-// ---- network ------------------------------------------------------
+// ---- input --------------------------------------------------------
 function postInput(data){
   return fetch('/input', {
     method: 'POST',
@@ -189,7 +201,6 @@ function postInput(data){
     keepalive: true
   }).catch(function(){ return null; });
 }
-
 function ratioAt(clientX, clientY){
   var r = stage.getBoundingClientRect();
   if (!r.width || !r.height) return {x: 0.5, y: 0.5};
@@ -202,12 +213,15 @@ function ratioAt(clientX, clientY){
 /* ---- scroll pipeline --------------------------------------------- *
  * Swipe pixels are accumulated and pushed to the VM as mouse wheel
  * notches (the server keeps the sub-notch remainder), so a swipe feels
- * like rolling the wheel instead of dragging the mouse.                */
-var scrollQueue = {dx: 0, dy: 0, needReset: false, resetSent: true, timer: 0, busy: false};
+ * like rolling the wheel instead of dragging the mouse. The pointer is
+ * sent along so the wheel lands on the window under the finger.        */
+var scrollQueue = {dx: 0, dy: 0, x: 0.5, y: 0.5, needReset: false, resetSent: true,
+                   timer: 0, busy: false, watchdog: 0};
 
-function queueScroll(dxPixels, dyPixels){
+function queueScroll(dxPixels, dyPixels, ratio){
   scrollQueue.dx += dxPixels;
   scrollQueue.dy += dyPixels;
+  if (ratio){ scrollQueue.x = ratio.x; scrollQueue.y = ratio.y; }
   scheduleScroll();
 }
 function scheduleScroll(){
@@ -222,11 +236,10 @@ function flushScroll(){
   scrollQueue.dx = 0; scrollQueue.dy = 0; scrollQueue.needReset = false;
   if (reset) scrollQueue.resetSent = true;
   scrollQueue.busy = true;
-  // If a request never settles (phone goes to sleep, tunnel stalls) the
-  // queue must not stay locked, or scrolling would stop for good.
   clearTimeout(scrollQueue.watchdog);
   scrollQueue.watchdog = setTimeout(function(){ scrollQueue.busy = false; }, 1500);
-  postInput({action: 'scroll', pixels: true, dx: dx, dy: dy, reset: reset})
+  postInput({action: 'scroll', pixels: true, dx: dx, dy: dy, reset: reset,
+             x_ratio: scrollQueue.x, y_ratio: scrollQueue.y})
     .then(function(){
       clearTimeout(scrollQueue.watchdog);
       scrollQueue.busy = false;
@@ -238,28 +251,21 @@ function flushScroll(){
 }
 
 // ---- touch / pen gestures ----------------------------------------
-var pointers = new Map();     // pointerId -> last position
-var single   = null;          // single finger gesture state
-var pinch    = null;          // two finger gesture state
-var lastTouchAt = 0;
-var mousePan = null;
-var mouseDown = null;
+var pointers = new Map();
+var single = null, pinch = null;
+var lastTouchAt = 0, mousePan = null, mouseDown = null;
 var lastMouseClick = {t: 0, x: 0, y: 0};
 
 function pointList(){ return Array.from(pointers.values()); }
 function dist(a, b){ return Math.hypot(a.x - b.x, a.y - b.y); }
-function midpoint(a, b){ return {x: (a.x + b.x) / 2, y: (a.y + b.y) / 2}; }
 
 function clearLongPress(){
   if (single && single.longPress){ clearTimeout(single.longPress); single.longPress = 0; }
 }
-
 function startSingle(e){
-  single = {
-    startX: e.clientX, startY: e.clientY,
-    lastX: e.clientX, lastY: e.clientY,
-    startedAt: now(), mode: null, longPress: 0
-  };
+  single = {startX: e.clientX, startY: e.clientY,
+            lastX: e.clientX, lastY: e.clientY,
+            startedAt: now(), mode: null, longPress: 0};
   single.longPress = setTimeout(function(){
     if (!single || single.mode) return;
     single.mode = 'longpress';
@@ -268,17 +274,13 @@ function startSingle(e){
     flash('Right click');
   }, LONG_PRESS_MS);
 }
-
 function startPinch(){
   var pts = pointList();
   if (pts.length < 2){ pinch = null; return; }
-  pinch = {
-    dist: Math.max(1, dist(pts[0], pts[1])),
-    midX: (pts[0].x + pts[1].x) / 2,
-    midY: (pts[0].y + pts[1].y) / 2
-  };
+  pinch = {dist: Math.max(1, dist(pts[0], pts[1])),
+           midX: (pts[0].x + pts[1].x) / 2,
+           midY: (pts[0].y + pts[1].y) / 2};
 }
-
 function handlePinch(){
   var pts = pointList();
   if (pts.length < 2){ pinch = null; return; }
@@ -287,12 +289,8 @@ function handlePinch(){
   var d = Math.max(1, dist(pts[0], pts[1]));
   var mx = (pts[0].x + pts[1].x) / 2;
   var my = (pts[0].y + pts[1].y) / 2;
-
-  // move the view with the fingers ...
   if (pinch.midX || pinch.midY){ panX += mx - pinch.midX; panY += my - pinch.midY; }
   pinch.midX = mx; pinch.midY = my;
-
-  // ... then zoom about the finger midpoint
   var ratio = d / pinch.dist;
   pinch.dist = d;
   if (Math.abs(ratio - 1) > 0.002){
@@ -302,77 +300,63 @@ function handlePinch(){
     applyView();
   }
 }
-
 function onPointerDown(e){
-  if (e.pointerType === 'mouse') return;     // mouse has its own handlers
+  if (e.pointerType === 'mouse') return;
   e.preventDefault();
   lastTouchAt = Date.now();
   try { viewport.setPointerCapture(e.pointerId); } catch (err) {}
   pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
-
   if (pointers.size === 1){
     pinch = null;
     startSingle(e);
   } else if (pointers.size === 2){
     clearLongPress();
     if (single) single.mode = single.mode || 'twofinger';
-    single = null;                           // never click after a pinch
+    single = null;
     startPinch();
   }
 }
-
 function onPointerMove(e){
   if (e.pointerType === 'mouse') return;
   var p = pointers.get(e.pointerId);
   if (!p) return;
   p.x = e.clientX; p.y = e.clientY;
-
   if (pointers.size >= 2){ handlePinch(); return; }
   if (!single) return;
-
   if (!single.mode){
-    var movedFromStart = Math.hypot(e.clientX - single.startX, e.clientY - single.startY);
-    if (movedFromStart < TAP_MOVE_PX) return;
+    var moved = Math.hypot(e.clientX - single.startX, e.clientY - single.startY);
+    if (moved < TAP_MOVE_PX) return;
     clearLongPress();
     single.mode = (swipeMode === 'pan') ? 'pan' : 'scroll';
     single.lastX = e.clientX; single.lastY = e.clientY;
     if (single.mode === 'scroll' && !scrollQueue.resetSent) scrollQueue.needReset = true;
     return;
   }
-
   var stepX = e.clientX - single.lastX;
   var stepY = e.clientY - single.lastY;
   if (!stepX && !stepY) return;
   single.lastX = e.clientX; single.lastY = e.clientY;
-
   if (single.mode === 'scroll'){
-    // client pixels -> desktop pixels, so the page follows the finger
-    var k = 1 / zoom;
-    queueScroll(stepX * k, stepY * k);
+    queueScroll(stepX / zoom, stepY / zoom, ratioAt(e.clientX, e.clientY));
   } else if (single.mode === 'pan'){
     panX += stepX; panY += stepY;
     clampPan();
     applyView();
   }
 }
-
 function endPointer(e, cancelled){
   if (e.pointerType === 'mouse') return;
   if (!pointers.has(e.pointerId)) return;
   pointers.delete(e.pointerId);
   lastTouchAt = Date.now();
-
   if (pointers.size >= 2){ handlePinch(); return; }
-
   if (pointers.size === 1){
-    // one finger lifted during a pinch: keep panning with the remaining finger
     pinch = null;
     var only = pointList()[0];
     single = {startX: only.x, startY: only.y, lastX: only.x, lastY: only.y,
               startedAt: now(), mode: 'pan', longPress: 0};
     return;
   }
-
   pinch = null;
   if (single){
     clearLongPress();
@@ -388,26 +372,21 @@ function endPointer(e, cancelled){
     single = null;
   }
   if (scrollQueue.dx || scrollQueue.dy) flushScroll();
-  // The next gesture starts from a clean wheel remainder.
   scrollQueue.needReset = true;
   scrollQueue.resetSent = false;
 }
-
 viewport.addEventListener('pointerdown', onPointerDown, {passive: false});
 viewport.addEventListener('pointermove', onPointerMove, {passive: false});
 viewport.addEventListener('pointerup', function(e){ endPointer(e, false); }, {passive: false});
 viewport.addEventListener('pointercancel', function(e){ endPointer(e, true); }, {passive: false});
-
-// stop the browser from hijacking two finger gestures / page zoom
 ['touchstart', 'touchmove', 'gesturestart', 'gesturechange'].forEach(function(name){
-  viewport.addEventListener(name, function(e){
-    if (e.cancelable) e.preventDefault();
-  }, {passive: false});
+  viewport.addEventListener(name, function(e){ if (e.cancelable) e.preventDefault(); },
+                            {passive: false});
 });
 
-// ---- mouse (desktop browsers) ------------------------------------
+// ---- mouse --------------------------------------------------------
 viewport.addEventListener('mousedown', function(e){
-  if (Date.now() - lastTouchAt < 800) return;      // synthetic click after a tap
+  if (Date.now() - lastTouchAt < 800) return;
   if (e.button === 1 || (e.button === 0 && e.altKey)){
     e.preventDefault();
     mousePan = {x: e.clientX, y: e.clientY};
@@ -416,7 +395,6 @@ viewport.addEventListener('mousedown', function(e){
   if (e.button !== 0) return;
   mouseDown = {x: e.clientX, y: e.clientY, moved: false};
 });
-
 window.addEventListener('mousemove', function(e){
   if (mousePan){
     panX += e.clientX - mousePan.x;
@@ -431,7 +409,6 @@ window.addEventListener('mousemove', function(e){
     mouseDown.moved = true;
   }
 });
-
 window.addEventListener('mouseup', function(e){
   if (mousePan){
     if (e.button === 1 || e.button === 0) mousePan = null;
@@ -448,8 +425,7 @@ window.addEventListener('mouseup', function(e){
     return;
   }
   // A double click is two real clicks; the VM composes the double/triple
-  // click itself, so sending a separate "dblclick" on top would click three
-  // times and open two windows.
+  // click itself, so a separate "dblclick" on top would click three times.
   var t = now();
   var r = ratioAt(down.x, down.y);
   var quick = t - lastMouseClick.t < 380 &&
@@ -459,7 +435,6 @@ window.addEventListener('mouseup', function(e){
   lastMouseClick = quick ? {t: 0, x: 0, y: 0} : {t: t, x: down.x, y: down.y};
   flash(quick ? 'Double click' : 'Click');
 });
-
 viewport.addEventListener('contextmenu', function(e){
   e.preventDefault();
   if (Date.now() - lastTouchAt < 800) return;
@@ -467,22 +442,19 @@ viewport.addEventListener('contextmenu', function(e){
   postInput({action: 'rclick', x_ratio: r.x, y_ratio: r.y});
   flash('Right click');
 });
-
 viewport.addEventListener('wheel', function(e){
   e.preventDefault();
-  if (e.ctrlKey || e.metaKey){        // Ctrl + wheel = zoom the view, like a map
-    var factor = Math.exp(-e.deltaY * 0.0025);
-    zoomTo(zoom * factor, e.clientX, e.clientY);
+  if (e.ctrlKey || e.metaKey){
+    zoomTo(zoom * Math.exp(-e.deltaY * 0.0025), e.clientX, e.clientY);
     return;
   }
-  var unit = e.deltaMode === 1 ? WHEEL_LINE_PX : (e.deltaMode === 2 ? vpH() : 1);
-  var k = 1 / zoom;                   // desktop pixels per client pixel
-  // wheel down must scroll the page down, i.e. the content moves up
-  queueScroll(-e.deltaX * unit * k, -e.deltaY * unit * k);
+  var unit = e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? vpH() : 1);
+  queueScroll(-e.deltaX * unit / zoom, -e.deltaY * unit / zoom,
+              ratioAt(e.clientX, e.clientY));
   flushScroll();
 }, {passive: false});
 
-// ---- keyboard (sent to the VM) -----------------------------------
+// ---- keyboard -----------------------------------------------------
 document.addEventListener('keydown', function(e){
   if (document.activeElement && document.activeElement.id === 'typeText') return;
   if (e.repeat) return;
@@ -521,7 +493,6 @@ function sendType(){
 window.sendType = sendType;
 window.sendKey = function(k){ postInput({action: 'key', keys: k}); };
 window.sendHotkey = function(k){ postInput({action: 'hotkey', keys: k}); };
-
 document.getElementById('typeText').addEventListener('keydown', function(e){
   if (e.key === 'Enter'){ e.preventDefault(); sendType(); }
 });
@@ -540,104 +511,168 @@ modeBtn.addEventListener('click', function(){
   flash('Swipe = ' + swipeMode);
 });
 
-/* Live picture width. A 960px stream gets blurry once you pinch in, so a
- * zoomed view asks the server for more pixels; 'low' keeps it cheap. */
-var qualityBtn = document.getElementById('qualityBtn');
-var streamWidth = 960;
-var streamMode = null;
-
-function desiredStreamWidth(){
-  if (qualityMode === 'high') return '?w=1600';
-  if (qualityMode === 'low')  return '?w=854';
+// ---- picture resolution ------------------------------------------
+var streamWidth = 0;
+function desiredWidth(){
+  if (qualityMode === 'high') return 1600;
+  if (qualityMode === 'low')  return 854;
   var need = screenW * zoom * (window.devicePixelRatio || 1);
-  return '?w=' + Math.round(clamp(need, 854, 1600));
+  return Math.round(clamp(need, 480, 1600));
 }
-
 function restartStream(){
-  if (snapshotMode) return;
-  var target = desiredStreamWidth();
-  if (target === streamMode) return;
-  streamMode = target;
-  img.src = '/stream' + target + '&t=' + Date.now();
+  var target = desiredWidth();
+  if (target === streamWidth) return;
+  streamWidth = target;
+  fetch('/quality?w=' + target).catch(function(){});
+  lastSeq = 0;                        // ask for a fresh full picture
 }
-
 qualityBtn.addEventListener('click', function(){
   qualityMode = (qualityMode === 'auto') ? 'high' : (qualityMode === 'high' ? 'low' : 'auto');
-  qualityBtn.textContent = 'HD: ' + (qualityMode === 'auto' ? 'Auto' : (qualityMode === 'high' ? 'High' : 'Low'));
-  streamMode = null;
+  qualityBtn.textContent = 'HD: ' + (qualityMode === 'auto' ? 'Auto'
+                        : (qualityMode === 'high' ? 'High' : 'Low'));
   restartStream();
   flash('Picture ' + qualityMode);
 });
-
-// re-evaluate stream resolution when the view size changes a lot
-var lastStreamCheck = 0;
-function maybeUpgradeStream(){
+var lastQualityCheck = 0;
+function maybeUpgradeQuality(){
   var t = now();
-  if (t - lastStreamCheck < 4000) return;
-  lastStreamCheck = t;
-  if (qualityMode !== 'auto') return;
+  if (t - lastQualityCheck < 4000 || qualityMode !== 'auto') return;
+  lastQualityCheck = t;
   restartStream();
 }
 
-// ---- screen size + live video ------------------------------------
-function applyScreenSize(w, h){
-  if (w > 0) screenW = w;
-  if (h > 0) screenH = h;
-  stage.style.width = screenW + 'px';
-  stage.style.height = screenH + 'px';
-  fitView();
+// ---- data saver --------------------------------------------------
+function updateDataLabel(){
+  dataBtn.textContent = 'Data: ' + (dataSaver ? 'Saver' : 'Normal');
+  dataBtn.className = dataSaver ? 'on' : '';
 }
-
-fetch('/info').then(function(r){ return r.json(); }).then(function(j){
-  applyScreenSize(j.width, j.height);
-  stEl.textContent = screenW + 'x' + screenH + ' | Live';
-  restartStream();          // ask for a picture that matches the fitted view
-}).catch(function(){
-  if (img.naturalWidth) applyScreenSize(img.naturalWidth, img.naturalHeight);
+dataBtn.addEventListener('click', function(){
+  dataSaver = !dataSaver;
+  updateDataLabel();
+  flash(dataSaver ? 'Data saver on: quiet screens stop traffic'
+                  : 'Data saver off');
+  if (!dataSaver) pollLoop();
 });
+updateDataLabel();
 
-var snapshotMode = false;
-var frames = 0, lastT = Date.now(), errors = 0, delay = 500;
-
-function startSnapshot(){
-  if (snapshotMode) return;
-  snapshotMode = true;
-  img.src = '/snapshot?t=' + Date.now();
-  (function load(){
-    var t = Date.now();
-    var next = new Image();
-    next.onload = function(){
-      if (!snapshotMode) return;
-      img.src = next.src;
-      errors = 0;
-      if (delay > 600) delay = 600;
-      frames++;
-      var elapsed = Date.now() - lastT;
-      if (elapsed >= 2000){
-        var fps = Math.round(frames * 1000 / elapsed);
-        stEl.textContent = screenW + 'x' + screenH + ' | ' + fps + ' FPS';
-        if (!flash.timer) fpsEl.textContent = fps + ' FPS | Live';
-        frames = 0; lastT = Date.now();
-      }
-      setTimeout(load, Math.max(80, delay - (Date.now() - t)));
+// ---- delta picture ------------------------------------------------
+var haveSize = false;
+function applySize(w, h){
+  if (!(w > 0 && h > 0)) return;
+  if (haveSize && w === frameW && h === frameH) return;
+  frameW = w; frameH = h;
+  canvas.width = w;
+  canvas.height = h;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, w, h);
+  haveSize = true;
+  pictureReady = false;
+}
+// Decode a tile. createImageBitmap is fastest; older Safari only has Image.
+function decodeBlob(blob){
+  if (typeof createImageBitmap === 'function'){
+    return createImageBitmap(blob).then(function(bitmap){
+      return {img: bitmap, close: function(){ if (bitmap.close) bitmap.close(); }};
+    });
+  }
+  return new Promise(function(resolve, reject){
+    var url = URL.createObjectURL(blob);
+    var image = new Image();
+    image.onload = function(){
+      resolve({img: image, close: function(){ URL.revokeObjectURL(url); }});
     };
-    next.onerror = function(){
-      errors++;
-      fpsEl.textContent = 'Reconnecting… (' + errors + ')';
-      stEl.textContent = 'Reconnecting…';
-      delay = Math.min(delay * 1.4, 4000);
-      setTimeout(load, Math.min(errors * 600, 3000));
+    image.onerror = function(){
+      URL.revokeObjectURL(url);
+      reject(new Error('decode failed'));
     };
-    next.src = '/snapshot?t=' + t;
-  })();
+    image.src = url;
+  });
 }
 
-img.onerror = function(){ startSnapshot(); };
-img.onload = function(){
-  if (!snapshotMode) stEl.textContent = screenW + 'x' + screenH + ' | Live MJPEG';
-};
-img.src = '/stream';
-setTimeout(function(){ if (img.naturalWidth === 0) startSnapshot(); }, 2500);
+function loadRect(rect, seq){
+  var url = '/tile?s=' + seq + '&i=' + rect.i;
+  return fetch(url, {cache: 'force-cache'})
+    .then(function(res){
+      if (!res.ok) throw new Error('tile ' + res.status);
+      return res.blob();
+    })
+    .then(function(blob){
+      bytesIn += blob.size || 0;
+      return decodeBlob(blob);
+    })
+    .then(function(decoded){
+      ctx.drawImage(decoded.img, rect.x, rect.y, rect.w, rect.h);
+      decoded.close();
+      drawn++;
+      lastDrawAt = now();
+      if (!pictureReady){ pictureReady = true; stEl.textContent = screenW + 'x' + screenH + ' | Live'; }
+      updateStats();
+    });
+}
+function requestTile(rect, seq){
+  if (inFlight >= MAX_PARALLEL){ pending.push({rect: rect, seq: seq}); return; }
+  inFlight++;
+  loadRect(rect, seq).catch(function(err){
+    // An expired rectangle means the client fell behind: resync.
+    if (String(err && err.message).indexOf('410') >= 0) lastSeq = 0;
+  }).then(function(){
+    inFlight--;
+    var next = pending.shift();
+    if (next) requestTile(next.rect, next.seq);
+  });
+}
+function updateStats(){
+  if (flash.timer) return;
+  fpsEl.textContent = drawn + ' tiles | ' + Math.round(bytesIn / 1024) + ' KB' +
+                      (dataSaver ? ' | saver' : '');
+}
+setInterval(updateStats, 1000);
+
+function handlePayload(payload){
+  if (!payload) return;
+  if (payload.w && payload.h) applySize(payload.w, payload.h);
+  if (payload.full){
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    pictureReady = false;
+  }
+  if (payload.r && payload.r.length){
+    dirtySince = now();
+    for (var i = 0; i < payload.r.length; i++){
+      requestTile(payload.r[i], payload.r[i].s || payload.seq);
+    }
+  }
+  if (typeof payload.seq === 'number') lastSeq = payload.seq;
+}
+
+function pollLoop(){
+  if (pollAbort) return;
+  var controller = ('AbortController' in window) ? new AbortController() : null;
+  pollAbort = controller || true;
+  var quiet = dataSaver && pictureReady && (now() - dirtySince) > 4000;
+  var wait = quiet ? 1 : POLL_TIMEOUT;      // idle: one cheap check per second
+  var timer = setTimeout(function(){
+    if (controller) controller.abort();
+  }, (wait + 15) * 1000);
+
+  fetch('/frames?seq=' + lastSeq + '&wait=' + wait,
+        {cache: 'no-store', signal: controller ? controller.signal : undefined})
+    .then(function(res){ return res.json(); })
+    .then(function(payload){
+      clearTimeout(timer);
+      pollAbort = null;
+      handlePayload(payload);
+      // An "empty" answer means the server already waited; still keep a
+      // small gap so a fast/erroneous response cannot spin the loop.
+      var gap = payload && payload.reason === 'empty' ? 120 : 0;
+      setTimeout(pollLoop, quiet ? 1000 : gap);
+    })
+    .catch(function(){
+      clearTimeout(timer);
+      pollAbort = null;
+      if (stEl) stEl.textContent = 'Reconnecting…';
+      setTimeout(pollLoop, quiet ? 1500 : POLL_RETRY_MS);
+    });
+}
 
 window.addEventListener('resize', function(){
   computeFit();
@@ -648,9 +683,19 @@ window.addEventListener('orientationchange', function(){
   setTimeout(function(){ computeFit(); fitView(); }, 250);
 });
 
-computeFit();
-clampPan();
-applyView();
+// ---- boot ---------------------------------------------------------
+fetch('/info').then(function(r){ return r.json(); }).then(function(j){
+  screenW = j.width || screenW;
+  screenH = j.height || screenH;
+  stEl.textContent = screenW + 'x' + screenH + ' | Connecting…';
+}).catch(function(){}).then(function(){
+  streamWidth = desiredWidth();
+  fetch('/quality?w=' + streamWidth).catch(function(){});
+  fitView();
+  pollLoop();
+});
+
+fitView();
 })();
 </script>
 </body>

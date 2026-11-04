@@ -18,6 +18,7 @@ import math
 import ctypes
 
 from phonefs_service import PhoneFSService, child_environment, process_options, terminate_process_tree
+import screen_delta
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID")
@@ -1623,6 +1624,10 @@ def _scroll_wheel_worker(flinger):
                 time.sleep(0.05)
 
 
+# Serialises "move the pointer, then turn the wheel" so two phones swiping at
+# the same time cannot interleave their moves and scroll the wrong window.
+_scroll_target_lock = threading.RLock()
+
 _scroll_worker_thread = None
 _scroll_worker_lock = threading.Lock()
 
@@ -1810,6 +1815,110 @@ def shutdown_remote_access():
         livestream_server.server_close()
 
 
+# ---------- Screen capture: frame + visible cursor ----------
+#
+# mss does not include the mouse pointer, so a viewer could not see where the
+# next click would land. The pointer is drawn into the frame instead. That
+# also means a "static" screen changes a little whenever the mouse moves,
+# which is exactly the feedback a remote desktop is expected to give.
+
+# A small arrow, in the spirit of the Windows pointer. Each line is a row:
+# "X" is the outline, "F" the fill, "." transparent.
+_CURSOR_ART = (
+    "X...........",
+    "XX..........",
+    "XFFX........",
+    "XFFX........",
+    "XFFFX.......",
+    "XFFFFX......",
+    "XFFFFFX.....",
+    "XFFFFFFX....",
+    "XFFFFFFFX...",
+    "XFFFFFFFFX..",
+    "XFFFFFFFFFX.",
+    "XFFFFFFFFFFX",
+    "XFFFFFXXXXXX",
+    "XFFXFFX.....",
+    "XFX.XFFX....",
+    "XX..XFFX....",
+    "X....XFFX...",
+    ".....XFFX...",
+    "......XX....",
+)
+_CURSOR_PALETTE = {"X": (0, 0, 0), "F": (255, 255, 255)}
+
+
+def _cursor_sprite():
+    """('W', 'H', rows of (b, g, r) or None) built without numpy."""
+    rows = _CURSOR_ART
+    height = len(rows)
+    width = max(len(row) for row in rows)
+    pixels = []
+    for row in rows:
+        line = []
+        for column in range(width):
+            char = row[column] if column < len(row) else "."
+            line.append(_CURSOR_PALETTE.get(char))
+        pixels.append(line)
+    return width, height, pixels
+
+
+def draw_cursor(frame, x, y):
+    """Draw the pointer into a BGR ``frame`` using numpy slicing.
+
+    ``frame[y, x]`` is written as a channel tuple, so no numpy import is
+    needed in this module (the runner only imports numpy inside the screen
+    server, which is why the sprite is plain data).
+    """
+    if frame is None or x is None or y is None:
+        return frame
+    try:
+        height, width = frame.shape[0], frame.shape[1]
+        sprite_w, sprite_h, pixels = _cursor_sprite()
+        left = max(0, min(width - sprite_w, int(x)))
+        top = max(0, min(height - sprite_h, int(y)))
+        for row in range(sprite_h):
+            for column in range(sprite_w):
+                colour = pixels[row][column]
+                if colour is not None and top + row < height and left + column < width:
+                    frame[top + row, left + column] = colour
+    except Exception as exc:            # never break the stream for a cursor
+        print(f"[cursor] {exc}")
+    return frame
+
+
+class ScreenCapture:
+    """Grab the primary monitor as BGR, with the pointer drawn on top."""
+
+    def __init__(self, mss_module, cv2_module, np_module):
+        self.mss = mss_module
+        self.cv2 = cv2_module
+        self.np = np_module
+
+    def size(self):
+        with self.mss.mss() as sct:
+            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            return monitor["width"], monitor["height"]
+
+    def grab(self):
+        try:
+            with self.mss.mss() as sct:
+                monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                shot = self.np.array(sct.grab(monitor))
+            frame = shot[:, :, :3].copy()          # BGRA -> BGR
+            try:
+                pyautogui = _ensure_pyautogui()
+                if pyautogui:
+                    point = pyautogui.position()
+                    draw_cursor(frame, getattr(point, "x", point[0]), getattr(point, "y", point[1]))
+            except Exception:
+                pass
+            return frame
+        except Exception as exc:
+            print(f"[capture] {exc}")
+            return None
+
+
 def create_desktop_app():
     """Build the remote-desktop Flask app.
 
@@ -1839,19 +1948,6 @@ def create_desktop_app():
     except:
         pass
 
-    def capture_jpeg(width=854, quality=35):
-        monitor = mss.mss().monitors[1] if len(mss.mss().monitors) > 1 else mss.mss().monitors[0]
-        # we use fresh mss each time to avoid thread issues
-        with mss.mss() as sct:
-            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-            sct_img = sct.grab(monitor)
-            frame = np.array(sct_img)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            h, w = frame.shape[:2]
-            new_h = int(h * (width / w))
-            frame_resized = cv2.resize(frame, (width, new_h))
-            _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-            return buffer.tobytes(), w, h
 
     def _clamp_stream_width(value, default=960):
         # A zoomed-in viewer asks for more pixels; never let a request
@@ -1862,27 +1958,95 @@ def create_desktop_app():
             return default
         return max(480, min(1920, width))
 
-    def gen_frames(width=960, quality=40):
+    # ---- dirty-tile streaming -------------------------------------
+    # One capture thread feeds every viewer. Only changed tiles are encoded,
+    # so an idle desktop costs a heartbeat every few seconds instead of a
+    # full JPEG frame ten times a second.
+
+    capture = ScreenCapture(mss, cv2, np)
+    try:
+        SCREEN_W, SCREEN_H = capture.size()
+    except Exception:
+        pass
+    hub = screen_delta.ScreenHub(capture.grab, scale_to=960,
+                                encoder=screen_delta.TileEncoder())
+    hub.start()
+
+    @app.route("/frames")
+    def frames_route():
+        """Long-poll: what changed since ``seq`` (0 = first paint)."""
+        try:
+            since = int(float(request.args.get("seq", 0) or 0))
+        except (TypeError, ValueError):
+            since = 0
+        try:
+            timeout = float(request.args.get("wait", 20) or 20)
+        except (TypeError, ValueError):
+            timeout = 20.0
+        timeout = max(0.0, min(30.0, timeout))
+        payload = hub.frames_since(since, timeout=timeout)
+        return jsonify(payload), 200, {
+            "Cache-Control": "no-store",
+            "X-Screen-Width": str(SCREEN_W),
+            "X-Screen-Height": str(SCREEN_H),
+        }
+
+    @app.route("/tile")
+    def tile_route():
+        """Encoded pixels for one rectangle of one update."""
+        try:
+            seq = int(request.args.get("s", 0))
+            index = int(request.args.get("i", 0))
+        except (TypeError, ValueError):
+            return Response("bad tile", status=400, mimetype="text/plain")
+        blob = hub.tile(seq, index)
+        if not blob:
+            return Response("expired", status=410, mimetype="text/plain")
+        data, mime = blob
+        return Response(data, mimetype=mime, headers={
+            "Cache-Control": "public, max-age=120",
+            "Content-Length": str(len(data)),
+        })
+
+    @app.route("/quality")
+    def quality_route():
+        """Change the resolution of the stream (HD / low data)."""
+        width = _clamp_stream_width(request.args.get("w"), 960)
+        applied = hub.set_scale(width)
+        return jsonify({"ok": True, "width": applied})
+
+    @app.route("/stats")
+    def stats_route():
+        return jsonify(hub.stats())
+
+    @app.route("/stream")
+    def stream():
+        # Kept for old bookmarks: a small MJPEG preview, not the viewer.
+        return Response(gen_frames(_clamp_stream_width(request.args.get("w"), 640), 45),
+                        mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+    def gen_frames(width=640, quality=45):
         width = _clamp_stream_width(width)
         quality = max(20, min(85, int(quality)))
         while True:
             try:
-                with mss.mss() as sct:
-                    monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                    sct_img = sct.grab(monitor)
-                    frame = np.array(sct_img)
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                    h, w = frame.shape[:2]
-                    new_w = min(width, w)
-                    new_h = int(h * (new_w / w))
-                    frame_resized = cv2.resize(frame, (new_w, new_h))
-                    _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-                    frame_bytes = buffer.tobytes()
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n'
-                           b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n' +
-                           frame_bytes + b'\r\n')
-                time.sleep(0.12)
+                frame = capture.grab()
+                if frame is None:
+                    time.sleep(0.5)
+                    continue
+                h, w = frame.shape[:2]
+                new_w = min(width, w)
+                new_h = int(h * (new_w / w))
+                if new_w != w:
+                    frame = cv2.resize(frame, (new_w, new_h))
+                _, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                frame_bytes = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n' +
+                       frame_bytes + b'\r\n')
+                time.sleep(0.2)
             except Exception as e:
                 print(f"Frame gen error: {e}")
                 time.sleep(0.5)
@@ -1916,16 +2080,6 @@ def create_desktop_app():
             })
         except Exception as e:
             return Response(f"Error: {e}", status=500)
-
-    @app.route("/stream")
-    def stream():
-        # ?w=<px> lets a zoomed-in viewer ask for a sharper picture;
-        # the default keeps the previous cost.
-        width = _clamp_stream_width(request.args.get("w"), 960)
-        quality = request.args.get("q", 40)
-        return Response(gen_frames(width, quality),
-                        mimetype='multipart/x-mixed-replace; boundary=frame',
-                        headers={'Cache-Control': 'no-store, no-cache, must-revalidate'})
 
     @app.route("/info")
     def info():
@@ -1999,20 +2153,22 @@ def create_desktop_app():
                 # text or move a window (that was the old bug).
                 if data.get("pixels"):
                     _ensure_scroll_worker()
-                    steps = _scroll_flinger.feed(
-                        data.get("dx", 0), data.get("dy", 0),
-                        scale=_safe_scale(data.get("scale", 1.0)),
-                        reset=bool(data.get("reset")))
-                    if data.get("cursor") and "x_ratio" in data:
-                        # Optional: keep the pointer under the finger so
-                        # hover-sensitive apps react in the right place.
-                        cx, cy = to_coords(data)
+                    # A wheel notch goes to the window under the pointer, so
+                    # move the pointer under the finger first. Without this a
+                    # swipe scrolled whatever window the mouse was left on
+                    # (often none), which is why scrolling felt broken.
+                    cx, cy = to_coords(data)
+                    with _scroll_target_lock:
                         if cx is not None:
                             try:
                                 pyautogui.moveTo(cx, cy, duration=0)
-                            except Exception:
-                                pass
-                    return jsonify({"ok": True, "queued": len(steps)})
+                            except Exception as exc:
+                                print(f"[scroll] move {exc}")
+                        queued = _scroll_flinger.feed(
+                            data.get("dx", 0), data.get("dy", 0),
+                            scale=_safe_scale(data.get("scale", 1.0)),
+                            reset=bool(data.get("reset")))
+                    return jsonify({"ok": True, "queued": len(queued), "at": [cx, cy]})
                 try:
                     amt = int(float(data.get("amount", 300)))
                 except (TypeError, ValueError):

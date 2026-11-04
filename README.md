@@ -59,7 +59,21 @@ Passwords are generated with `secrets`, configured over stdin (not command-line 
 
 The **Swipe: Scroll / Pan** toolbar button switches the one-finger gesture between scrolling the VM and panning a zoomed view (handy when the desktop is zoomed in). **🔍− / 🔍+ / Fit / 1:1** set the zoom without pinching, and the **HD** button (Auto/High/Low) decides how much screen resolution the live picture uses — Auto asks for more pixels while you are zoomed in and less when you are zoomed out.
 
-A swipe is translated by the server into real wheel notches (with a carried remainder, so slow and fast swipes move the same distance), which is why it can no longer select text or drag a window. Pinch zoom happens in the browser, so it stays instant; use `zoom in` / `zoom out` / `zoom 150` / `zoom reset` if you want the VM's own desktop zoom changed instead.
+A swipe is translated by the server into real wheel notches (with a carried remainder, so slow and fast swipes move the same distance), which is why it can no longer select text or drag a window. Before each notch the pointer is moved under your finger, because a wheel message goes to the window under the mouse — that is what makes scrolling land in the right place. Pinch zoom happens in the browser, so it stays instant; use `zoom in` / `zoom out` / `zoom 150` / `zoom reset` if you want the VM's own desktop zoom changed instead.
+
+#### Bandwidth: only what changed is sent
+
+The picture is **not** a stream of full JPEG frames any more (that re-sent the whole screen several times a second even when nothing moved — several Mbit/s of mobile data for a static desktop). It now works like VNC / TeamViewer / RDP:
+
+* the desktop is cut into 32 px tiles and compared with the previous frame, so **only changed tiles are encoded**;
+* neighbouring changed tiles are merged into a few small rectangles (typing costs ~1–3 KB instead of a whole frame);
+* WebP is used when the installed OpenCV supports it (~30% smaller than JPEG for screen content), JPEG otherwise;
+* the browser long-polls `/frames?seq=N` and downloads only the rectangles from `/tile`, drawing them on a canvas it keeps locally;
+* a static screen therefore transfers **nothing** (a tiny heartbeat every 5 s keeps the poll alive), and a reconnecting phone resumes from the last full frame instead of starting over;
+* the mouse pointer is drawn into the frame, so you can see where a click will land;
+* **Data: Normal / Saver** in the toolbar stops polling entirely after a few quiet seconds (handy on mobile data); touching the screen wakes it instantly. The header/fps chip shows tiles drawn and KB received, and `/stats` reports the server side.
+
+Resolution still follows the zoom level (Auto): it is capped at 960 px wide by default, up to 1600 while zoomed in, because a zoomed-in view needs real pixels more than an idle view does.
 
 #### Try the gestures without a VM
 

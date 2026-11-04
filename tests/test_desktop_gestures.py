@@ -35,12 +35,19 @@ def _stub(name, **attrs):
 
 
 def _install_capture_stubs():
-    """cv2/mss/flask are not needed to exercise the routes or gesture maths."""
-    _stub("cv2",
-          COLOR_BGRA2BGR=0, IMWRITE_JPEG_QUALITY=1,
-          cvtColor=lambda frame, code: frame,
-          resize=lambda frame, size: frame,
-          imencode=lambda ext, frame, params: (True, mock.Mock(tobytes=lambda: b"jpeg")))
+    """cv2/mss are not needed to exercise the routes or the gesture maths."""
+    cv2 = types.ModuleType("cv2")
+    cv2.COLOR_BGRA2BGR = 0
+    cv2.COLOR_BGR2GRAY = 6
+    cv2.INTER_AREA = 3
+    cv2.IMWRITE_JPEG_QUALITY = 1
+    cv2.IMWRITE_WEBP_QUALITY = 2
+    cv2.IMWRITE_PNG_COMPRESSION = 3
+    cv2.cvtColor = lambda frame, code: frame
+    cv2.resize = lambda frame, size, interpolation=None: frame
+    cv2.imencode = lambda ext, frame, params: (
+        True, mock.Mock(tobytes=lambda: "jpeg-{}".format(ext).encode()))
+    sys.modules["cv2"] = cv2
 
     class _Sct:
         monitors = [{}, {"width": 1920, "height": 1080}]
@@ -52,15 +59,21 @@ def _install_capture_stubs():
             return False
 
         def grab(self, monitor):
-            return _frame()
+            try:
+                import numpy
+                return numpy.zeros((1080, 1920, 4), dtype=numpy.uint8)
+            except ImportError:                     # pragma: no cover
+                return _Frame()
 
-    _stub("mss", mss=lambda: _Sct())
+    mss = types.ModuleType("mss")
+    mss.mss = lambda: _Sct()
+    sys.modules["mss"] = mss
 
 
 class _Frame:
-    """Minimal numpy-like frame: shape (1080, 1920, 3)."""
+    """Minimal numpy-like BGRA frame."""
 
-    shape = (1080, 1920, 3)
+    shape = (1080, 1920, 4)
 
 
 class FakePyAutoGUI:
@@ -92,6 +105,9 @@ class FakePyAutoGUI:
 
     def hotkey(self, *keys):
         self.calls.append(("hotkey",) + keys)
+
+    def position(self):
+        return types.SimpleNamespace(x=100, y=200)
 
     def press(self, key):
         self.calls.append(("press", key))
@@ -254,6 +270,14 @@ class InputRouteTests(unittest.TestCase):
                 break
             time.sleep(0.02)
         self.assertTrue([c for c in self.gui.calls if c[0] == "hscroll"])
+
+    def test_swipe_moves_the_pointer_to_the_finger_first(self):
+        # A wheel notch goes to the window under the pointer. Without the
+        # move, a swipe scrolled whatever window the mouse was left on.
+        self.post({"action": "scroll", "pixels": True, "dx": 0, "dy": -120,
+                   "reset": True, "x_ratio": 0.25, "y_ratio": 0.75})
+        moves = [c for c in self.gui.calls if c[0] == "moveTo"]
+        self.assertEqual(moves[:1], [("moveTo", 480, 810)])
 
     def test_legacy_notch_scroll_still_works(self):
         response = self.post({"action": "scroll", "amount": -300})
