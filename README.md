@@ -61,7 +61,7 @@ Passwords are generated with `secrets`, configured over stdin (not command-line 
 
 The **Swipe: Scroll / Pan** toolbar button switches the one-finger gesture between scrolling the VM and panning a zoomed view (handy when the desktop is zoomed in). **🔍− / 🔍+ / Fit / 1:1** set the zoom without pinching, and the **HD** button (Auto/High/Low) decides how much screen resolution the live picture uses — Auto asks for more pixels while you are zoomed in and less when you are zoomed out.
 
-A swipe is translated by the server into real wheel notches (with a carried remainder, so slow and fast swipes move the same distance), which is why it can no longer select text or drag a window. Before each notch the pointer is moved under your finger, because a wheel message goes to the window under the mouse — that is what makes scrolling land in the right place. Pinch zoom happens in the browser, so it stays instant; use `zoom in` / `zoom out` / `zoom 150` / `zoom reset` if you want the VM's own desktop zoom changed instead.
+A swipe is translated by the server into real wheel notches (with a carried remainder, so slow and fast swipes move the same distance), which is why it can no longer select text or drag a window. A wheel message goes to the window under the mouse, so the pointer is **parked under your finger once, when the touch starts**, and never moves again during that gesture — a previous build moved it on every scroll request, which made the pointer visibly race up and down the screen while swiping. One finger pixel is one *desktop* pixel (the picture is smaller than the desktop), so a swipe scrolls as far as the finger travels. Pinch zoom happens in the browser, so it stays instant; use `zoom in` / `zoom out` / `zoom 150` / `zoom reset` if you want the VM's own desktop zoom changed instead.
 
 #### Bandwidth: only what changed is sent
 
@@ -85,6 +85,12 @@ python tools/preview_desktop.py --port 8000
 ```
 
 This serves the real viewer against a drawn fake desktop, so swiping, pinching, tapping and wheel scrolling can be tried in a browser before running the workflow.
+
+```sh
+node tools/simulate_swipe.js          # what a phone swipe actually sends
+```
+
+That drives the real `desktop_client.html` script in Node with a fake DOM and a virtual clock, reproduces a 240 px one-finger swipe on a 390x780 phone view, and prints every request the viewer made: it must be exactly **one** pointer park (on touch-down, no `x_ratio` on the wheel requests afterwards), the wheel sum must equal the finger travel (factor 1.000), and no click/drag may be produced.
 
 ### 📁 File Manager (Telegram)
 - `pwd`, `ls [path]`, `cat <file>`, `get <file>` (sends file), `mkdir`, `rm`, `mv <src> <dst>`, `cp <src> <dst>`, `write <file> <text>`, `append <file> <text>`, `find <pattern>`, `tree`, `du`, `zip`, `unzip`, `wget <url>`, `cd <path>`

@@ -2272,23 +2272,20 @@ def create_desktop_app():
                 # and the pointer is not dragged, so it can never select
                 # text or move a window (that was the old bug).
                 if data.get("pixels"):
+                    # A swipe is a wheel gesture, not a pointer drag: the
+                    # mouse must stay where the user left it. Moving it here
+                    # (as the previous build did, so the wheel landed under
+                    # the finger) made the pointer race up and down the screen
+                    # during every swipe, which also changed what the wheel
+                    # scrolled. The viewer now parks the pointer once, when
+                    # the finger touches down (action "pointer").
                     _ensure_scroll_worker()
-                    # A wheel notch goes to the window under the pointer, so
-                    # move the pointer under the finger first. Without this a
-                    # swipe scrolled whatever window the mouse was left on
-                    # (often none), which is why scrolling felt broken.
-                    cx, cy = to_coords(data)
                     with _scroll_target_lock:
-                        if cx is not None:
-                            try:
-                                pyautogui.moveTo(cx, cy, duration=0)
-                            except Exception as exc:
-                                print(f"[scroll] move {exc}")
                         queued = _scroll_flinger.feed(
                             data.get("dx", 0), data.get("dy", 0),
                             scale=_safe_scale(data.get("scale", 1.0)),
                             reset=bool(data.get("reset")))
-                    return jsonify({"ok": True, "queued": len(queued), "at": [cx, cy]})
+                    return jsonify({"ok": True, "queued": len(queued)})
                 try:
                     amt = int(float(data.get("amount", 300)))
                 except (TypeError, ValueError):
@@ -2296,6 +2293,22 @@ def create_desktop_app():
                 if amt:
                     pyautogui.scroll(amt)
                 return jsonify({"ok": True})
+            elif action in ("pointer", "move"):
+                # Park the pointer under the finger once per gesture (the
+                # viewer sends this on touch-down). A wheel event is
+                # delivered to the window under the pointer, so the pointer
+                # has to be in the right place *before* the first notch --
+                # but it must not follow the swipe afterwards.
+                cx, cy = to_coords(data)
+                if cx is None:
+                    return jsonify({"ok": False, "error": "pointer needs x/y"})
+                with _scroll_target_lock:
+                    try:
+                        pyautogui.moveTo(cx, cy, duration=0)
+                    except Exception as exc:
+                        print(f"[pointer] move {exc}")
+                        return jsonify({"ok": False, "error": str(exc)})
+                return jsonify({"ok": True, "at": [cx, cy]})
             elif action == "zoom":
                 # Desktop zoom on the VM. Pinching is normally handled
                 # locally by the browser; this is the explicit path.

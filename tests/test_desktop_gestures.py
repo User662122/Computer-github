@@ -137,6 +137,31 @@ class ViewerPageTests(unittest.TestCase):
         self.assertIn("queueScroll", self.page)
         self.assertIn("single.mode = (swipeMode === 'pan') ? 'pan' : 'scroll'", self.page)
 
+    def test_pointer_is_parked_once_per_gesture_not_per_scroll_step(self):
+        # Regression: the pointer used to be moved on every scroll request,
+        # so it visibly ran up and down the screen during a swipe.
+        self.assertIn("function parkPointer(ratio)", self.page)
+        self.assertIn("parkPointer(ratioAt(e.clientX, e.clientY))", self.page)
+        # The wheel request must not carry a position (which the server used
+        # to move the pointer to).
+        self.assertNotIn("x_ratio: scrollQueue.x", self.page)
+        self.assertIn("{action: 'scroll', pixels: true, dx: dx, dy: dy, reset: reset}",
+                      self.page)
+
+    def test_swipe_distance_is_desktop_pixels_not_picture_pixels(self):
+        # The picture is 960 px for a 1920 px desktop, so a finger pixel is
+        # two desktop pixels; without this the page scrolled half as far.
+        self.assertIn("var unit = screenW / Math.max(1, frameW);", self.page)
+        self.assertIn("var desktop = screenW / Math.max(1, frameW);", self.page)
+
+    def test_fit_uses_the_picture_size(self):
+        # Fitting against the desktop size left a fitted phone view at half
+        # size ("fails to fit the screen") and doubled the swipe distance.
+        source = self.page[self.page.index("function computeFit()"):
+                            self.page.index("function maxZoom()")]
+        self.assertIn("frameW", source)
+        self.assertNotIn("screenW", source)
+
     def test_pinch_zoom_is_implemented_client_side(self):
         self.assertIn("startPinch", self.page)
         self.assertIn("zoomTo(zoom * ratio", self.page)
@@ -271,13 +296,42 @@ class InputRouteTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertTrue([c for c in self.gui.calls if c[0] == "hscroll"])
 
-    def test_swipe_moves_the_pointer_to_the_finger_first(self):
-        # A wheel notch goes to the window under the pointer. Without the
-        # move, a swipe scrolled whatever window the mouse was left on.
-        self.post({"action": "scroll", "pixels": True, "dx": 0, "dy": -120,
-                   "reset": True, "x_ratio": 0.25, "y_ratio": 0.75})
-        moves = [c for c in self.gui.calls if c[0] == "moveTo"]
-        self.assertEqual(moves[:1], [("moveTo", 480, 810)])
+    def _drain(self):
+        import time
+        for _ in range(50):
+            if not runner._scroll_flinger.pending and self.gui.calls:
+                break
+            time.sleep(0.02)
+        time.sleep(0.15)
+
+    def test_swipe_parking_the_pointer_moves_it_once(self):
+        # A wheel notch goes to the window under the pointer, so the viewer
+        # parks it under the finger when the touch starts (action "pointer").
+        response = self.post({"action": "pointer", "x_ratio": 0.25, "y_ratio": 0.75})
+        self.assertEqual(response.get_json()["at"], [480, 810])
+        self.assertEqual([c for c in self.gui.calls if c[0] == "moveTo"],
+                         [("moveTo", 480, 810)])
+
+    def test_swipe_never_drags_the_pointer_along(self):
+        # The old build moved the pointer on *every* scroll request, which is
+        # why the pointer was seen racing up and down the screen while
+        # swiping. Scroll requests now move nothing, even if they carry a
+        # position (older viewers did).
+        for dy in (-100, -100, -100, -100):
+            self.post({"action": "scroll", "pixels": True, "dx": 0, "dy": dy,
+                       "x_ratio": 0.1, "y_ratio": 0.1})
+        self._drain()
+        self.assertEqual([c for c in self.gui.calls if c[0] == "moveTo"], [])
+        self.assertTrue([c for c in self.gui.calls if c[0] == "scroll"])
+        self.assertEqual(self.gui.mouse_button_names(), [])
+
+    def test_scroll_reports_nothing_to_move_and_keeps_the_wheel_running(self):
+        body = self.post({"action": "scroll", "pixels": True, "dx": 0, "dy": -260,
+                          "reset": True}).get_json()
+        self.assertTrue(body["ok"])
+        self.assertNotIn("at", body)
+        self._drain()
+        self.assertTrue([c for c in self.gui.calls if c[0] == "scroll"])
 
     def test_legacy_notch_scroll_still_works(self):
         response = self.post({"action": "scroll", "amount": -300})
