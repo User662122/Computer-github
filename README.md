@@ -29,7 +29,7 @@ Sending `livestream` (or `live`) starts **two separate listeners and two separat
 - PhoneFS setup runs in the background. A PhoneFS error is reported in Telegram and does not stop screen sharing. Startup failures are retried, including HTTP/2 fallback if QUIC is blocked.
 - A quick tunnel can briefly return `502` while connecting; wait a few seconds and refresh. Both links are temporary and disappear when the workflow ends (maximum six hours).
 
-The workflow pre-downloads the exact [fixed Windows ZIP](https://github.com/User662122/Reddit-user/blob/af3e6a305e6387fc869800709e9264bf2a949d0c/PhoneFS%20fixed%20Windows_Agent%20.zip). `.github/phonefs_service.py` verifies its SHA-256 and uses **`phonefs_win_FIXED.py`** directly, not the setup BAT, which expects a different filename and can fall back to an older download. Downloads and per-session config live under the runner's temporary directory, not in Git. PhoneFS needs no extra Python dependencies; it reuses the workflow's Python and `cloudflared`.
+The workflow pre-downloads the exact fixed Windows package from its public [Google Drive link](https://drive.google.com/file/d/11ZqoB5wQ0C0Ajj8MMCydDnD3OC_GEGKS/view?usp=drivesdk) (file id `11ZqoB5wQ0C0Ajj8MMCydDnD3OC_GEGKS`); the old GitHub copy was removed, so the download no longer uses `raw.githubusercontent.com`. The shared file is the generated single-file agent itself (`phonefs_win_FIXED.py`, produced by `make_bundle.py`); a ZIP containing that same agent is still accepted too. `.github/phonefs_service.py` verifies the package's SHA-256, uses **`phonefs_win_FIXED.py`** directly (never the setup BAT, which expects a different filename and can fall back to an older download), and confirms a bare script really is the agent before installing it. The download follows Google Drive's one-time confirmation page for large/scanned files (a second Drive host is tried as a mirror). Downloads and per-session config live under the runner's temporary directory, not in Git. PhoneFS needs no extra Python dependencies; it reuses the workflow's Python and `cloudflared`.
 
 Passwords are generated with `secrets`, configured over stdin (not command-line arguments), and checked with an actual local login before Telegram receives the link. PhoneFS stores a password hash; the bot keeps the plaintext only in memory and does not log it. Neither public tunnel URL is printed in Actions logs. Each new session has its own config, so a saved password cannot silently replace the one sent to Telegram. The ZIP's hard-coded public Filebin URL announcement is disabled; Telegram is the announcement channel. The POSIX-only interactive PTY is disabled on this Windows build; its file manager and `/api/exec`, `/api/python`, and job APIs remain available.
 
@@ -44,6 +44,45 @@ Passwords are generated with `secrets`, configured over stdin (not command-line 
 - **Mouse:** `click 500 300` (coords), `click Save` (UI control name), `rclick 100 200`, `doubleclick 400 500`, `move 800 500`, `drag 100 100 500 500`, `scroll up 500`, `pos`
 - **Live Remote Desktop:** `livestream` / `live` → get `https://*.trycloudflare.com` link.  
   Open on phone/PC: **tap to click, drag to select, scroll, type** in the text box, keyboard shortkeys (Ctrl+C/V, Alt+F4, Win+R…). Works like VNC with ~5-8 FPS, auto-reconnects.
+
+#### Touch gestures (phone / tablet)
+
+| Gesture | What it does |
+|---|---|
+| **One-finger swipe** | Scrolls the VM screen exactly like the mouse wheel (never moves the mouse) |
+| **Two-finger pinch out / in** | Zooms the view in / out around your fingers |
+| **Two-finger drag** | Pans the zoomed view |
+| **Tap** | Left click at that point |
+| **Long press** (~0.6 s) | Right click |
+| **Double tap** | Double click |
+| Mouse: wheel | Scroll, `Ctrl` + wheel | Zoom, middle-drag / `Alt` + drag | Pan |
+
+The **Swipe: Scroll / Pan** toolbar button switches the one-finger gesture between scrolling the VM and panning a zoomed view (handy when the desktop is zoomed in). **🔍− / 🔍+ / Fit / 1:1** set the zoom without pinching, and the **HD** button (Auto/High/Low) decides how much screen resolution the live picture uses — Auto asks for more pixels while you are zoomed in and less when you are zoomed out.
+
+A swipe is translated by the server into real wheel notches (with a carried remainder, so slow and fast swipes move the same distance), which is why it can no longer select text or drag a window. Before each notch the pointer is moved under your finger, because a wheel message goes to the window under the mouse — that is what makes scrolling land in the right place. Pinch zoom happens in the browser, so it stays instant; use `zoom in` / `zoom out` / `zoom 150` / `zoom reset` if you want the VM's own desktop zoom changed instead.
+
+#### Bandwidth: only what changed is sent
+
+The picture is **not** a stream of full JPEG frames any more (that re-sent the whole screen several times a second even when nothing moved — several Mbit/s of mobile data for a static desktop). It now works like VNC / TeamViewer / RDP:
+
+* the desktop is cut into 32 px tiles and compared with the previous frame, so **only changed tiles are encoded**;
+* neighbouring changed tiles are merged into a few small rectangles (typing costs ~1–3 KB instead of a whole frame);
+* WebP is used when the installed OpenCV supports it (~30% smaller than JPEG for screen content), JPEG otherwise;
+* the browser long-polls `/frames?seq=N` and downloads only the rectangles from `/tile`, drawing them on a canvas it keeps locally;
+* a static screen therefore transfers **nothing** (a tiny heartbeat every 5 s keeps the poll alive), and a reconnecting phone resumes from the last full frame instead of starting over;
+* the mouse pointer is drawn into the frame, so you can see where a click will land;
+* **Data: Normal / Saver** in the toolbar stops polling entirely after a few quiet seconds (handy on mobile data); touching the screen wakes it instantly. The header/fps chip shows tiles drawn and KB received, and `/stats` reports the server side.
+
+Resolution still follows the zoom level (Auto): it is capped at 960 px wide by default, up to 1600 while zoomed in, because a zoomed-in view needs real pixels more than an idle view does.
+
+#### Try the gestures without a VM
+
+```sh
+pip install flask pillow numpy
+python tools/preview_desktop.py --port 8000
+```
+
+This serves the real viewer against a drawn fake desktop, so swiping, pinching, tapping and wheel scrolling can be tried in a browser before running the workflow.
 
 ### 📁 File Manager (Telegram)
 - `pwd`, `ls [path]`, `cat <file>`, `get <file>` (sends file), `mkdir`, `rm`, `mv <src> <dst>`, `cp <src> <dst>`, `write <file> <text>`, `append <file> <text>`, `find <pattern>`, `tree`, `du`, `zip`, `unzip`, `wget <url>`, `cd <path>`
@@ -100,7 +139,7 @@ python -m pip install requests
 python -m unittest discover -s tests -v
 ```
 
-The tests do not need a Telegram token or a public tunnel. They cover the pinned installer, checksum rejection, port fallback, private credential delivery, startup login verification, idempotent starts, fresh passwords on restart, stop/cancellation cleanup, and Telegram command routing. Run the updated workflow on Windows for the final live Telegram/Cloudflare check.
+The tests do not need a Telegram token or a public tunnel. They cover the pinned installer, checksum rejection, port fallback, private credential delivery, startup login verification, idempotent starts, fresh passwords on restart, stop/cancellation cleanup, and Telegram command routing. `tests/test_desktop_gestures.py` additionally pins the viewer's gestures: a swipe must produce wheel events and never press a mouse button, pixel deltas must survive as wheel notches, pinch zoom must be client side, and the desktop `zoom` command must step through Ctrl+plus/minus. Run the updated workflow on Windows for the final live Telegram/Cloudflare check.
 
 ---
 
