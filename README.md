@@ -45,6 +45,31 @@ Passwords are generated with `secrets`, configured over stdin (not command-line 
 - **Live Remote Desktop:** `livestream` / `live` → get `https://*.trycloudflare.com` link.  
   Open on phone/PC: **tap to click, drag to select, scroll, type** in the text box, keyboard shortkeys (Ctrl+C/V, Alt+F4, Win+R…). Works like VNC with ~5-8 FPS, auto-reconnects.
 
+#### Touch gestures (phone / tablet)
+
+| Gesture | What it does |
+|---|---|
+| **One-finger swipe** | Scrolls the VM screen exactly like the mouse wheel (never moves the mouse) |
+| **Two-finger pinch out / in** | Zooms the view in / out around your fingers |
+| **Two-finger drag** | Pans the zoomed view |
+| **Tap** | Left click at that point |
+| **Long press** (~0.6 s) | Right click |
+| **Double tap** | Double click |
+| Mouse: wheel | Scroll, `Ctrl` + wheel | Zoom, middle-drag / `Alt` + drag | Pan |
+
+The **Swipe: Scroll / Pan** toolbar button switches the one-finger gesture between scrolling the VM and panning a zoomed view (handy when the desktop is zoomed in). **🔍− / 🔍+ / Fit / 1:1** set the zoom without pinching, and the **HD** button (Auto/High/Low) decides how much screen resolution the live picture uses — Auto asks for more pixels while you are zoomed in and less when you are zoomed out.
+
+A swipe is translated by the server into real wheel notches (with a carried remainder, so slow and fast swipes move the same distance), which is why it can no longer select text or drag a window. Pinch zoom happens in the browser, so it stays instant; use `zoom in` / `zoom out` / `zoom 150` / `zoom reset` if you want the VM's own desktop zoom changed instead.
+
+#### Try the gestures without a VM
+
+```sh
+pip install flask pillow numpy
+python tools/preview_desktop.py --port 8000
+```
+
+This serves the real viewer against a drawn fake desktop, so swiping, pinching, tapping and wheel scrolling can be tried in a browser before running the workflow.
+
 ### 📁 File Manager (Telegram)
 - `pwd`, `ls [path]`, `cat <file>`, `get <file>` (sends file), `mkdir`, `rm`, `mv <src> <dst>`, `cp <src> <dst>`, `write <file> <text>`, `append <file> <text>`, `find <pattern>`, `tree`, `du`, `zip`, `unzip`, `wget <url>`, `cd <path>`
 - **Upload:** just send any file/photo to Telegram → saved to VM (`/home/runner/...`)
@@ -100,7 +125,7 @@ python -m pip install requests
 python -m unittest discover -s tests -v
 ```
 
-The tests do not need a Telegram token or a public tunnel. They cover the pinned installer, checksum rejection, port fallback, private credential delivery, startup login verification, idempotent starts, fresh passwords on restart, stop/cancellation cleanup, and Telegram command routing. Run the updated workflow on Windows for the final live Telegram/Cloudflare check.
+The tests do not need a Telegram token or a public tunnel. They cover the pinned installer, checksum rejection, port fallback, private credential delivery, startup login verification, idempotent starts, fresh passwords on restart, stop/cancellation cleanup, and Telegram command routing. `tests/test_desktop_gestures.py` additionally pins the viewer's gestures: a swipe must produce wheel events and never press a mouse button, pixel deltas must survive as wheel notches, pinch zoom must be client side, and the desktop `zoom` command must step through Ctrl+plus/minus. Run the updated workflow on Windows for the final live Telegram/Cloudflare check.
 
 ---
 

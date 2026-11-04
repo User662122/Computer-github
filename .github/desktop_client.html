@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>GitHub VM Remote Desktop</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden;overscroll-behavior:none}
+  body{background:#0a0a0a;color:#eee;position:fixed;inset:0;display:flex;flex-direction:column;
+       font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+       -webkit-text-size-adjust:100%;-webkit-tap-highlight-color:transparent}
+  header{background:#1a1a1a;padding:8px 12px;display:flex;align-items:center;justify-content:space-between;
+         border-bottom:1px solid #333;flex:none}
+  header h1{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  header .status{font-size:11px;color:#0f0;white-space:nowrap;margin-left:8px}
+  #toolbar{background:#222;padding:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;
+           border-bottom:1px solid #333;flex:none}
+  #toolbar button,#toolbar input{font-size:12px;padding:6px 10px;border-radius:6px;border:1px solid #444;
+           background:#333;color:#fff;-webkit-appearance:none;appearance:none}
+  #toolbar button:active{background:#555}
+  #toolbar input{background:#111;min-width:120px;flex:1 1 120px}
+  #viewport{flex:1 1 auto;min-height:0;position:relative;overflow:hidden;background:#000;
+            touch-action:none;overscroll-behavior:none;
+            -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  #stage{position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform;background:#000}
+  #screen{display:block;width:100%;height:100%;pointer-events:none;
+          user-select:none;-webkit-user-drag:none;image-rendering:auto}
+  #overlay{position:absolute;inset:0;pointer-events:none;display:flex;align-items:flex-start;
+           justify-content:center;padding-top:6px}
+  #fps{font:11px monospace;background:rgba(0,0,0,.7);color:#0f0;padding:3px 6px;border-radius:4px}
+  .keys{display:flex;gap:4px;flex-wrap:wrap}
+  .keys button{padding:5px 8px;font-size:11px}
+  .hint{font-size:10px;line-height:1.5;color:#8a8a8a;padding:5px 8px;text-align:center;background:#111;flex:none}
+  .sep{width:1px;height:22px;background:#444;margin:0 2px}
+  #modeBtn.on{border-color:#3ea6ff;color:#8fd0ff}
+</style>
+</head>
+<body>
+  <header>
+    <h1>🖥️ GitHub VM Remote</h1>
+    <div class="status" id="st">Connecting…</div>
+  </header>
+  <div id="toolbar">
+    <input id="typeText" placeholder="Type text here &amp; Send" autocomplete="off" autocapitalize="off" spellcheck="false" />
+    <button onclick="sendType()">Send (Paste)</button>
+    <button onclick="sendKey('enter')">Enter</button>
+    <button onclick="sendKey('backspace')">⌫</button>
+    <button onclick="sendKey('tab')">Tab</button>
+    <button onclick="sendKey('escape')">Esc</button>
+    <div class="sep"></div>
+    <div class="keys">
+      <button onclick="sendHotkey('ctrl+c')">Ctrl+C</button>
+      <button onclick="sendHotkey('ctrl+v')">Ctrl+V</button>
+      <button onclick="sendHotkey('ctrl+a')">Ctrl+A</button>
+      <button onclick="sendHotkey('ctrl+z')">Ctrl+Z</button>
+      <button onclick="sendHotkey('alt+f4')">Alt+F4</button>
+      <button onclick="sendHotkey('win+r')">Win+R</button>
+      <button onclick="sendHotkey('win+d')">Win+D</button>
+    </div>
+    <div class="sep"></div>
+    <button onclick="sendKey('up')">↑</button>
+    <button onclick="sendKey('down')">↓</button>
+    <button onclick="sendKey('left')">←</button>
+    <button onclick="sendKey('right')">→</button>
+    <div class="sep"></div>
+    <button id="zoomOut" title="Zoom out">🔍−</button>
+    <button id="zoomIn" title="Zoom in">🔍+</button>
+    <button id="zoomFit" title="Fit whole desktop">Fit</button>
+    <button id="zoomOne" title="Actual size">1:1</button>
+    <button id="modeBtn" class="on" title="What a one-finger swipe does">Swipe: Scroll</button>
+    <button id="qualityBtn" title="Sharper live picture while zoomed in">HD: Auto</button>
+    <button onclick="location.reload()">↻</button>
+  </div>
+  <div id="viewport">
+    <div id="stage"><img id="screen" src="/snapshot" alt="desktop" draggable="false"></div>
+    <div id="overlay"><div id="fps">Live</div></div>
+  </div>
+  <div class="hint" id="hint">Swipe = scroll wheel • Pinch = zoom • Tap = click • Long-press = right-click • Double-tap = double-click</div>
+<script>
+(function(){
+'use strict';
+
+/* ------------------------------------------------------------------ *
+ * Remote desktop client.
+ *
+ * Touch is NOT converted into a mouse drag any more. Mapping a swipe to
+ * press-move-release on the VM selected text / dragged windows instead of
+ * scrolling. Gestures are now:
+ *   one finger swipe   -> mouse wheel scroll (or pan the zoomed view)
+ *   two finger pinch   -> zoom the local view (not the remote screen)
+ *   two finger drag    -> pan the zoomed view
+ *   tap / long press   -> click / right click
+ * Mouse keeps its old behaviour (click, drag to select, wheel to scroll)
+ * and gains Ctrl+wheel zoom plus middle-drag panning.
+ * ------------------------------------------------------------------ */
+
+var viewport = document.getElementById('viewport');
+var stage    = document.getElementById('stage');
+var img      = document.getElementById('screen');
+var fpsEl    = document.getElementById('fps');
+var stEl     = document.getElementById('st');
+var modeBtn  = document.getElementById('modeBtn');
+
+// ---- geometry -----------------------------------------------------
+var screenW = 1920, screenH = 1080;
+var zoom = 1, panX = 0, panY = 0, fitScale = 1;
+
+// ---- tuning -------------------------------------------------------
+var TAP_MOVE_PX      = 12;    // finger must stay inside this to count as a tap
+var TAP_MS           = 600;   // ... and released before the long press fires
+var LONG_PRESS_MS    = 650;   // hold still this long for a right click
+var DRAG_EPS         = 4;     // mouse drag threshold
+var SWIPE_SEND_MS    = 55;    // scroll throttle
+var MIN_FIT_FACTOR   = 0.35;  // how far below "fit" the user may zoom out
+var MAX_ABS_ZOOM     = 8;
+var WHEEL_LINE_PX    = 16;
+
+var swipeMode = 'scroll';     // 'scroll' | 'pan'
+var qualityMode = 'auto';     // 'auto' | 'high' | 'low' (live picture width)
+
+// ---- helpers ------------------------------------------------------
+function clamp(v, lo, hi){ return v < lo ? lo : (v > hi ? hi : v); }
+function vpRect(){ return viewport.getBoundingClientRect(); }
+function vpW(){ return viewport.clientWidth  || 1; }
+function vpH(){ return viewport.clientHeight || 1; }
+function now(){ return (window.performance && performance.now) ? performance.now() : Date.now(); }
+function flash(msg){
+  if (!fpsEl) return;
+  fpsEl.textContent = msg;
+  clearTimeout(flash.timer);
+  flash.timer = setTimeout(function(){ fpsEl.textContent = 'Live'; }, 900);
+}
+
+// ---- view math ----------------------------------------------------
+function computeFit(){
+  var s = Math.min(vpW() / screenW, vpH() / screenH);
+  if (!isFinite(s) || s <= 0) s = 1;
+  fitScale = Math.min(s, 1);          // never enlarge past actual size when fitting
+}
+function maxZoom(){ return clamp(Math.max(fitScale * 10, 2), 2, MAX_ABS_ZOOM); }
+function minZoom(){ return fitScale * MIN_FIT_FACTOR; }
+
+function clampPan(){
+  var w = vpW(), h = vpH();
+  var cw = screenW * zoom, ch = screenH * zoom;
+  if (cw <= w + 0.5) panX = (w - cw) / 2; else panX = clamp(panX, w - cw, 0);
+  if (ch <= h + 0.5) panY = (h - ch) / 2; else panY = clamp(panY, h - ch, 0);
+}
+
+function applyView(){
+  stage.style.transform = 'translate3d(' + panX + 'px,' + panY + 'px,0) scale(' + zoom + ')';
+}
+
+function fitView(){
+  computeFit();
+  zoom = fitScale;
+  clampPan();                 // centres the desktop
+  applyView();
+}
+
+function zoomTo(newZoom, clientX, clientY){
+  newZoom = clamp(newZoom, minZoom(), maxZoom());
+  if (!isFinite(newZoom) || newZoom <= 0) return;
+  var r = vpRect();
+  var ax = clientX - r.left, ay = clientY - r.top;
+  var dx = (ax - panX) / zoom;      // desktop point under the fingers (before zoom)
+  var dy = (ay - panY) / zoom;
+  zoom = newZoom;
+  panX = ax - dx * zoom;
+  panY = ay - dy * zoom;
+  clampPan();
+  applyView();
+  maybeUpgradeStream();
+}
+
+function zoomByStep(factor){
+  var r = vpRect();
+  zoomTo(zoom * factor, r.left + r.width / 2, r.top + r.height / 2);
+  flash('Zoom ' + Math.round(zoom / fitScale * 100) + '%');
+}
+
+// ---- network ------------------------------------------------------
+function postInput(data){
+  return fetch('/input', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(data),
+    keepalive: true
+  }).catch(function(){ return null; });
+}
+
+function ratioAt(clientX, clientY){
+  var r = stage.getBoundingClientRect();
+  if (!r.width || !r.height) return {x: 0.5, y: 0.5};
+  return {
+    x: clamp((clientX - r.left) / r.width, 0, 1),
+    y: clamp((clientY - r.top) / r.height, 0, 1)
+  };
+}
+
+/* ---- scroll pipeline --------------------------------------------- *
+ * Swipe pixels are accumulated and pushed to the VM as mouse wheel
+ * notches (the server keeps the sub-notch remainder), so a swipe feels
+ * like rolling the wheel instead of dragging the mouse.                */
+var scrollQueue = {dx: 0, dy: 0, needReset: false, resetSent: true, timer: 0, busy: false};
+
+function queueScroll(dxPixels, dyPixels){
+  scrollQueue.dx += dxPixels;
+  scrollQueue.dy += dyPixels;
+  scheduleScroll();
+}
+function scheduleScroll(){
+  if (scrollQueue.timer || scrollQueue.busy) return;
+  scrollQueue.timer = setTimeout(flushScroll, SWIPE_SEND_MS);
+}
+function flushScroll(){
+  if (scrollQueue.timer){ clearTimeout(scrollQueue.timer); scrollQueue.timer = 0; }
+  if (scrollQueue.busy) return;
+  var dx = scrollQueue.dx, dy = scrollQueue.dy, reset = scrollQueue.needReset;
+  if (!dx && !dy && !reset) return;
+  scrollQueue.dx = 0; scrollQueue.dy = 0; scrollQueue.needReset = false;
+  if (reset) scrollQueue.resetSent = true;
+  scrollQueue.busy = true;
+  // If a request never settles (phone goes to sleep, tunnel stalls) the
+  // queue must not stay locked, or scrolling would stop for good.
+  clearTimeout(scrollQueue.watchdog);
+  scrollQueue.watchdog = setTimeout(function(){ scrollQueue.busy = false; }, 1500);
+  postInput({action: 'scroll', pixels: true, dx: dx, dy: dy, reset: reset})
+    .then(function(){
+      clearTimeout(scrollQueue.watchdog);
+      scrollQueue.busy = false;
+      if (scrollQueue.dx || scrollQueue.dy || scrollQueue.needReset) scheduleScroll();
+    }, function(){
+      clearTimeout(scrollQueue.watchdog);
+      scrollQueue.busy = false;
+    });
+}
+
+// ---- touch / pen gestures ----------------------------------------
+var pointers = new Map();     // pointerId -> last position
+var single   = null;          // single finger gesture state
+var pinch    = null;          // two finger gesture state
+var lastTouchAt = 0;
+var mousePan = null;
+var mouseDown = null;
+var lastMouseClick = {t: 0, x: 0, y: 0};
+
+function pointList(){ return Array.from(pointers.values()); }
+function dist(a, b){ return Math.hypot(a.x - b.x, a.y - b.y); }
+function midpoint(a, b){ return {x: (a.x + b.x) / 2, y: (a.y + b.y) / 2}; }
+
+function clearLongPress(){
+  if (single && single.longPress){ clearTimeout(single.longPress); single.longPress = 0; }
+}
+
+function startSingle(e){
+  single = {
+    startX: e.clientX, startY: e.clientY,
+    lastX: e.clientX, lastY: e.clientY,
+    startedAt: now(), mode: null, longPress: 0
+  };
+  single.longPress = setTimeout(function(){
+    if (!single || single.mode) return;
+    single.mode = 'longpress';
+    var r = ratioAt(single.startX, single.startY);
+    postInput({action: 'rclick', x_ratio: r.x, y_ratio: r.y});
+    flash('Right click');
+  }, LONG_PRESS_MS);
+}
+
+function startPinch(){
+  var pts = pointList();
+  if (pts.length < 2){ pinch = null; return; }
+  pinch = {
+    dist: Math.max(1, dist(pts[0], pts[1])),
+    midX: (pts[0].x + pts[1].x) / 2,
+    midY: (pts[0].y + pts[1].y) / 2
+  };
+}
+
+function handlePinch(){
+  var pts = pointList();
+  if (pts.length < 2){ pinch = null; return; }
+  if (!pinch) startPinch();
+  if (!pinch) return;
+  var d = Math.max(1, dist(pts[0], pts[1]));
+  var mx = (pts[0].x + pts[1].x) / 2;
+  var my = (pts[0].y + pts[1].y) / 2;
+
+  // move the view with the fingers ...
+  if (pinch.midX || pinch.midY){ panX += mx - pinch.midX; panY += my - pinch.midY; }
+  pinch.midX = mx; pinch.midY = my;
+
+  // ... then zoom about the finger midpoint
+  var ratio = d / pinch.dist;
+  pinch.dist = d;
+  if (Math.abs(ratio - 1) > 0.002){
+    zoomTo(zoom * ratio, mx, my);
+  } else {
+    clampPan();
+    applyView();
+  }
+}
+
+function onPointerDown(e){
+  if (e.pointerType === 'mouse') return;     // mouse has its own handlers
+  e.preventDefault();
+  lastTouchAt = Date.now();
+  try { viewport.setPointerCapture(e.pointerId); } catch (err) {}
+  pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+
+  if (pointers.size === 1){
+    pinch = null;
+    startSingle(e);
+  } else if (pointers.size === 2){
+    clearLongPress();
+    if (single) single.mode = single.mode || 'twofinger';
+    single = null;                           // never click after a pinch
+    startPinch();
+  }
+}
+
+function onPointerMove(e){
+  if (e.pointerType === 'mouse') return;
+  var p = pointers.get(e.pointerId);
+  if (!p) return;
+  p.x = e.clientX; p.y = e.clientY;
+
+  if (pointers.size >= 2){ handlePinch(); return; }
+  if (!single) return;
+
+  if (!single.mode){
+    var movedFromStart = Math.hypot(e.clientX - single.startX, e.clientY - single.startY);
+    if (movedFromStart < TAP_MOVE_PX) return;
+    clearLongPress();
+    single.mode = (swipeMode === 'pan') ? 'pan' : 'scroll';
+    single.lastX = e.clientX; single.lastY = e.clientY;
+    if (single.mode === 'scroll' && !scrollQueue.resetSent) scrollQueue.needReset = true;
+    return;
+  }
+
+  var stepX = e.clientX - single.lastX;
+  var stepY = e.clientY - single.lastY;
+  if (!stepX && !stepY) return;
+  single.lastX = e.clientX; single.lastY = e.clientY;
+
+  if (single.mode === 'scroll'){
+    // client pixels -> desktop pixels, so the page follows the finger
+    var k = 1 / zoom;
+    queueScroll(stepX * k, stepY * k);
+  } else if (single.mode === 'pan'){
+    panX += stepX; panY += stepY;
+    clampPan();
+    applyView();
+  }
+}
+
+function endPointer(e, cancelled){
+  if (e.pointerType === 'mouse') return;
+  if (!pointers.has(e.pointerId)) return;
+  pointers.delete(e.pointerId);
+  lastTouchAt = Date.now();
+
+  if (pointers.size >= 2){ handlePinch(); return; }
+
+  if (pointers.size === 1){
+    // one finger lifted during a pinch: keep panning with the remaining finger
+    pinch = null;
+    var only = pointList()[0];
+    single = {startX: only.x, startY: only.y, lastX: only.x, lastY: only.y,
+              startedAt: now(), mode: 'pan', longPress: 0};
+    return;
+  }
+
+  pinch = null;
+  if (single){
+    clearLongPress();
+    var elapsed = now() - single.startedAt;
+    var travelled = Math.hypot(e.clientX - single.startX, e.clientY - single.startY);
+    if (!single.mode && !cancelled && elapsed <= TAP_MS && travelled <= TAP_MOVE_PX){
+      var r = ratioAt(single.startX, single.startY);
+      postInput({action: 'click', x_ratio: r.x, y_ratio: r.y});
+      flash('Click');
+    } else if (single.mode === 'scroll'){
+      flushScroll();
+    }
+    single = null;
+  }
+  if (scrollQueue.dx || scrollQueue.dy) flushScroll();
+  // The next gesture starts from a clean wheel remainder.
+  scrollQueue.needReset = true;
+  scrollQueue.resetSent = false;
+}
+
+viewport.addEventListener('pointerdown', onPointerDown, {passive: false});
+viewport.addEventListener('pointermove', onPointerMove, {passive: false});
+viewport.addEventListener('pointerup', function(e){ endPointer(e, false); }, {passive: false});
+viewport.addEventListener('pointercancel', function(e){ endPointer(e, true); }, {passive: false});
+
+// stop the browser from hijacking two finger gestures / page zoom
+['touchstart', 'touchmove', 'gesturestart', 'gesturechange'].forEach(function(name){
+  viewport.addEventListener(name, function(e){
+    if (e.cancelable) e.preventDefault();
+  }, {passive: false});
+});
+
+// ---- mouse (desktop browsers) ------------------------------------
+viewport.addEventListener('mousedown', function(e){
+  if (Date.now() - lastTouchAt < 800) return;      // synthetic click after a tap
+  if (e.button === 1 || (e.button === 0 && e.altKey)){
+    e.preventDefault();
+    mousePan = {x: e.clientX, y: e.clientY};
+    return;
+  }
+  if (e.button !== 0) return;
+  mouseDown = {x: e.clientX, y: e.clientY, moved: false};
+});
+
+window.addEventListener('mousemove', function(e){
+  if (mousePan){
+    panX += e.clientX - mousePan.x;
+    panY += e.clientY - mousePan.y;
+    mousePan = {x: e.clientX, y: e.clientY};
+    clampPan();
+    applyView();
+    return;
+  }
+  if (mouseDown && (Math.abs(e.clientX - mouseDown.x) > DRAG_EPS ||
+                    Math.abs(e.clientY - mouseDown.y) > DRAG_EPS)){
+    mouseDown.moved = true;
+  }
+});
+
+window.addEventListener('mouseup', function(e){
+  if (mousePan){
+    if (e.button === 1 || e.button === 0) mousePan = null;
+    return;
+  }
+  if (e.button !== 0 || !mouseDown) return;
+  var down = mouseDown;
+  mouseDown = null;
+  if (Date.now() - lastTouchAt < 800) return;
+  if (down.moved){
+    var a = ratioAt(down.x, down.y), b = ratioAt(e.clientX, e.clientY);
+    postInput({action: 'drag', x_ratio: a.x, y_ratio: a.y, x2_ratio: b.x, y2_ratio: b.y});
+    flash('Drag');
+    return;
+  }
+  // A double click is two real clicks; the VM composes the double/triple
+  // click itself, so sending a separate "dblclick" on top would click three
+  // times and open two windows.
+  var t = now();
+  var r = ratioAt(down.x, down.y);
+  var quick = t - lastMouseClick.t < 380 &&
+              Math.abs(down.x - lastMouseClick.x) < 12 &&
+              Math.abs(down.y - lastMouseClick.y) < 12;
+  postInput({action: 'click', x_ratio: r.x, y_ratio: r.y});
+  lastMouseClick = quick ? {t: 0, x: 0, y: 0} : {t: t, x: down.x, y: down.y};
+  flash(quick ? 'Double click' : 'Click');
+});
+
+viewport.addEventListener('contextmenu', function(e){
+  e.preventDefault();
+  if (Date.now() - lastTouchAt < 800) return;
+  var r = ratioAt(e.clientX, e.clientY);
+  postInput({action: 'rclick', x_ratio: r.x, y_ratio: r.y});
+  flash('Right click');
+});
+
+viewport.addEventListener('wheel', function(e){
+  e.preventDefault();
+  if (e.ctrlKey || e.metaKey){        // Ctrl + wheel = zoom the view, like a map
+    var factor = Math.exp(-e.deltaY * 0.0025);
+    zoomTo(zoom * factor, e.clientX, e.clientY);
+    return;
+  }
+  var unit = e.deltaMode === 1 ? WHEEL_LINE_PX : (e.deltaMode === 2 ? vpH() : 1);
+  var k = 1 / zoom;                   // desktop pixels per client pixel
+  // wheel down must scroll the page down, i.e. the content moves up
+  queueScroll(-e.deltaX * unit * k, -e.deltaY * unit * k);
+  flushScroll();
+}, {passive: false});
+
+// ---- keyboard (sent to the VM) -----------------------------------
+document.addEventListener('keydown', function(e){
+  if (document.activeElement && document.activeElement.id === 'typeText') return;
+  if (e.repeat) return;
+  var key = (e.key || '').toLowerCase();
+  if (key === 'enter' || key === 'tab' || key === 'escape' || key === 'backspace' ||
+      key === 'delete' || key === 'arrowup' || key === 'arrowdown' ||
+      key === 'arrowleft' || key === 'arrowright'){
+    e.preventDefault();
+    var map = {'arrowup': 'up', 'arrowdown': 'down', 'arrowleft': 'left', 'arrowright': 'right'};
+    postInput({action: 'key', keys: map[key] || key});
+  } else if (e.ctrlKey || e.altKey || e.metaKey){
+    var combo = [];
+    if (e.ctrlKey) combo.push('ctrl');
+    if (e.altKey) combo.push('alt');
+    if (e.metaKey) combo.push('win');
+    if (key.length === 1) combo.push(key);
+    else if (['control', 'alt', 'meta', 'shift'].indexOf(key) === -1) combo.push(key);
+    if (combo.length > 1){
+      e.preventDefault();
+      postInput({action: 'hotkey', keys: combo.join('+')});
+    }
+  } else if (key.length === 1){
+    postInput({action: 'type', text: e.key});
+  }
+});
+
+// ---- toolbar ------------------------------------------------------
+function sendType(){
+  var el = document.getElementById('typeText');
+  var t = el.value;
+  if (!t) return;
+  postInput({action: 'type', text: t});
+  el.value = '';
+  flash('Typed ' + t.length + ' chars');
+}
+window.sendType = sendType;
+window.sendKey = function(k){ postInput({action: 'key', keys: k}); };
+window.sendHotkey = function(k){ postInput({action: 'hotkey', keys: k}); };
+
+document.getElementById('typeText').addEventListener('keydown', function(e){
+  if (e.key === 'Enter'){ e.preventDefault(); sendType(); }
+});
+document.getElementById('zoomIn').addEventListener('click', function(){ zoomByStep(1.25); });
+document.getElementById('zoomOut').addEventListener('click', function(){ zoomByStep(1 / 1.25); });
+document.getElementById('zoomFit').addEventListener('click', function(){ fitView(); flash('Fit'); });
+document.getElementById('zoomOne').addEventListener('click', function(){
+  var r = vpRect();
+  zoomTo(1, r.left + r.width / 2, r.top + r.height / 2);
+  flash('1:1');
+});
+modeBtn.addEventListener('click', function(){
+  swipeMode = (swipeMode === 'scroll') ? 'pan' : 'scroll';
+  modeBtn.textContent = 'Swipe: ' + (swipeMode === 'scroll' ? 'Scroll' : 'Pan');
+  modeBtn.className = (swipeMode === 'scroll') ? 'on' : '';
+  flash('Swipe = ' + swipeMode);
+});
+
+/* Live picture width. A 960px stream gets blurry once you pinch in, so a
+ * zoomed view asks the server for more pixels; 'low' keeps it cheap. */
+var qualityBtn = document.getElementById('qualityBtn');
+var streamWidth = 960;
+var streamMode = null;
+
+function desiredStreamWidth(){
+  if (qualityMode === 'high') return '?w=1600';
+  if (qualityMode === 'low')  return '?w=854';
+  var need = screenW * zoom * (window.devicePixelRatio || 1);
+  return '?w=' + Math.round(clamp(need, 854, 1600));
+}
+
+function restartStream(){
+  if (snapshotMode) return;
+  var target = desiredStreamWidth();
+  if (target === streamMode) return;
+  streamMode = target;
+  img.src = '/stream' + target + '&t=' + Date.now();
+}
+
+qualityBtn.addEventListener('click', function(){
+  qualityMode = (qualityMode === 'auto') ? 'high' : (qualityMode === 'high' ? 'low' : 'auto');
+  qualityBtn.textContent = 'HD: ' + (qualityMode === 'auto' ? 'Auto' : (qualityMode === 'high' ? 'High' : 'Low'));
+  streamMode = null;
+  restartStream();
+  flash('Picture ' + qualityMode);
+});
+
+// re-evaluate stream resolution when the view size changes a lot
+var lastStreamCheck = 0;
+function maybeUpgradeStream(){
+  var t = now();
+  if (t - lastStreamCheck < 4000) return;
+  lastStreamCheck = t;
+  if (qualityMode !== 'auto') return;
+  restartStream();
+}
+
+// ---- screen size + live video ------------------------------------
+function applyScreenSize(w, h){
+  if (w > 0) screenW = w;
+  if (h > 0) screenH = h;
+  stage.style.width = screenW + 'px';
+  stage.style.height = screenH + 'px';
+  fitView();
+}
+
+fetch('/info').then(function(r){ return r.json(); }).then(function(j){
+  applyScreenSize(j.width, j.height);
+  stEl.textContent = screenW + 'x' + screenH + ' | Live';
+  restartStream();          // ask for a picture that matches the fitted view
+}).catch(function(){
+  if (img.naturalWidth) applyScreenSize(img.naturalWidth, img.naturalHeight);
+});
+
+var snapshotMode = false;
+var frames = 0, lastT = Date.now(), errors = 0, delay = 500;
+
+function startSnapshot(){
+  if (snapshotMode) return;
+  snapshotMode = true;
+  img.src = '/snapshot?t=' + Date.now();
+  (function load(){
+    var t = Date.now();
+    var next = new Image();
+    next.onload = function(){
+      if (!snapshotMode) return;
+      img.src = next.src;
+      errors = 0;
+      if (delay > 600) delay = 600;
+      frames++;
+      var elapsed = Date.now() - lastT;
+      if (elapsed >= 2000){
+        var fps = Math.round(frames * 1000 / elapsed);
+        stEl.textContent = screenW + 'x' + screenH + ' | ' + fps + ' FPS';
+        if (!flash.timer) fpsEl.textContent = fps + ' FPS | Live';
+        frames = 0; lastT = Date.now();
+      }
+      setTimeout(load, Math.max(80, delay - (Date.now() - t)));
+    };
+    next.onerror = function(){
+      errors++;
+      fpsEl.textContent = 'Reconnecting… (' + errors + ')';
+      stEl.textContent = 'Reconnecting…';
+      delay = Math.min(delay * 1.4, 4000);
+      setTimeout(load, Math.min(errors * 600, 3000));
+    };
+    next.src = '/snapshot?t=' + t;
+  })();
+}
+
+img.onerror = function(){ startSnapshot(); };
+img.onload = function(){
+  if (!snapshotMode) stEl.textContent = screenW + 'x' + screenH + ' | Live MJPEG';
+};
+img.src = '/stream';
+setTimeout(function(){ if (img.naturalWidth === 0) startSnapshot(); }, 2500);
+
+window.addEventListener('resize', function(){
+  computeFit();
+  if (zoom <= fitScale * 1.02) fitView();
+  else { clampPan(); applyView(); }
+});
+window.addEventListener('orientationchange', function(){
+  setTimeout(function(){ computeFit(); fitView(); }, 250);
+});
+
+computeFit();
+clampPan();
+applyView();
+})();
+</script>
+</body>
+</html>

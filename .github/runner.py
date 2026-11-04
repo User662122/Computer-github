@@ -14,6 +14,8 @@ import platform
 import zipfile
 import pathlib
 import functools
+import math
+import ctypes
 
 from phonefs_service import PhoneFSService, child_environment, process_options, terminate_process_tree
 
@@ -1467,6 +1469,279 @@ def run_tunnel_with_autorestart(chat_id, stop_event):
             return
 
 
+# ---------- Remote-desktop viewer, scroll and zoom plumbing ----------
+
+DESKTOP_CLIENT_FILE = pathlib.Path(__file__).resolve().with_name("desktop_client.html")
+
+
+def _desktop_client_html():
+    """Read the browser viewer that sits next to this script.
+
+    The page is read per request (it is small) so edits take effect without
+    restarting a six-hour workflow run; a short cache avoids re-reading it for
+    every reconnect of a phone.
+    """
+    try:
+        stat = DESKTOP_CLIENT_FILE.stat()
+    except OSError as exc:
+        raise FileNotFoundError(str(DESKTOP_CLIENT_FILE)) from exc
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = getattr(_desktop_client_html, "_cache", None)
+    if cached and cached[0] == key:
+        return cached[1]
+    page = DESKTOP_CLIENT_FILE.read_text(encoding="utf-8")
+    _desktop_client_html._cache = (key, page)
+    return page
+
+
+# Windows wheel notches are 120 units (WHEEL_DELTA) per click, while
+# pyautogui.scroll() counts clicks. A swipe is pixel-based, so these constants
+# decide how far one notch moves the page.
+WHEEL_DELTA = 120
+DESKTOP_NOTCH_PIXELS = 100.0   # desktop pixels scrolled by one wheel notch
+WHEEL_ACCEL_PIXELS = 900.0     # fast flicks get a little extra distance
+WHEEL_MAX_NOTCHES = 8          # cap per request so a flick stays smooth
+ZOOM_STEP = 1.25               # Ctrl +/- step for the desktop zoom
+ZOOM_MAX = 500                 # percent
+
+
+class _ScrollFlinger:
+    """Turn swipe pixels into wheel notches, keeping the remainder.
+
+    Wheel messages are integers, so a small swipe would round to nothing and
+    a fast one would jitter if every touch move produced its own event. The
+    leftover fraction is carried into the next move, which makes a slow drag
+    scroll the same distance as a quick flick.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.carry_x = 0.0
+        self.carry_y = 0.0
+        self.pending = []      # [(notches_x, notches_y)] for the wheel thread
+
+    def reset(self):
+        with self.lock:
+            self.carry_x = 0.0
+            self.carry_y = 0.0
+
+    def feed(self, dx_pixels, dy_pixels, scale=1.0, reset=False):
+        """Queue wheel movement for a swipe of dx/dy *desktop* pixels."""
+        with self.lock:
+            if reset:
+                self.carry_x = 0.0
+                self.carry_y = 0.0
+            try:
+                dx = float(dx_pixels or 0) * (scale or 1.0)
+                dy = float(dy_pixels or 0) * (scale or 1.0)
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(dx) or not math.isfinite(dy):
+                return []
+            # A laggy pointer can report one huge jump; ignore the absurd part.
+            dx = max(-4000.0, min(4000.0, dx))
+            dy = max(-4000.0, min(4000.0, dy))
+            speed = math.hypot(dx, dy)
+            accel = 1.0 + min(speed, WHEEL_ACCEL_PIXELS) / WHEEL_ACCEL_PIXELS * 0.6
+            self.carry_x += dx / DESKTOP_NOTCH_PIXELS * accel
+            self.carry_y += dy / DESKTOP_NOTCH_PIXELS * accel
+            nx = int(self.carry_x)          # truncates toward zero, keeps sign
+            ny = int(self.carry_y)
+            nx = max(-WHEEL_MAX_NOTCHES, min(WHEEL_MAX_NOTCHES, nx))
+            ny = max(-WHEEL_MAX_NOTCHES, min(WHEEL_MAX_NOTCHES, ny))
+            if nx:
+                self.carry_x -= nx
+            if ny:
+                self.carry_y -= ny
+            # Do not keep a surplus beyond the cap: the wheel would keep
+            # turning after the finger stopped (rubber-band feeling).
+            self.carry_x = max(-0.999, min(0.999, self.carry_x))
+            self.carry_y = max(-0.999, min(0.999, self.carry_y))
+            steps = []
+            # Both axes in one step when they share a sign, so a diagonal
+            # swipe is one wheel event instead of two.
+            shared = min(abs(nx), abs(ny))
+            if nx and ny and shared and (nx > 0) == (ny > 0):
+                sx, sy = (1 if nx > 0 else -1), (1 if ny > 0 else -1)
+                steps.append((sx * shared, sy * shared))
+                nx -= sx * shared
+                ny -= sy * shared
+            if nx:
+                steps.append((nx, 0))
+            if ny:
+                steps.append((0, ny))
+            self.pending.extend(steps)
+            return steps
+
+    def take(self):
+        with self.lock:
+            pending, self.pending = self.pending, []
+            return pending
+
+
+_scroll_flinger = _ScrollFlinger()
+
+
+def _safe_scale(value, default=1.0):
+    """Sanitise the viewer's zoom compensation factor."""
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(scale) or scale <= 0:
+        return default
+    return max(0.25, min(4.0, scale))
+
+
+def _scroll_wheel_worker(flinger):
+    """Replay queued steps as wheel events, never blocking the HTTP handler.
+
+    pyautogui.scroll() takes ~10 ms; issuing several per touch move inside the
+    request handler would lag the UI and stall the live stream. One worker
+    keeps the order but costs a single thread.
+    """
+    while True:
+        steps = flinger.take()
+        if not steps:
+            time.sleep(0.004)
+            continue
+        pyautogui = _ensure_pyautogui()
+        if not pyautogui:
+            time.sleep(0.2)
+            continue
+        for nx, ny in steps:
+            try:
+                if nx and hasattr(pyautogui, "hscroll"):
+                    # Horizontal swipes scroll sideways; combined with a
+                    # vertical step this is a diagonal swipe.
+                    pyautogui.hscroll(nx)
+                if ny:
+                    # pyautogui: positive scrolls up, negative scrolls down.
+                    pyautogui.scroll(ny)
+            except Exception as exc:      # keep the worker alive
+                print(f"[scroll] {exc}")
+                time.sleep(0.05)
+
+
+_scroll_worker_thread = None
+_scroll_worker_lock = threading.Lock()
+
+
+def _ensure_scroll_worker():
+    global _scroll_worker_thread
+    with _scroll_worker_lock:
+        if _scroll_worker_thread and _scroll_worker_thread.is_alive():
+            return _scroll_worker_thread
+        _scroll_worker_thread = threading.Thread(
+            target=_scroll_wheel_worker, args=(_scroll_flinger,),
+            daemon=True, name="Remote scroll wheel")
+        _scroll_worker_thread.start()
+        return _scroll_worker_thread
+
+
+# ---- Desktop zoom (Telegram commands / explicit viewer request) ----
+#
+# Pinching is handled inside the browser: it is instant and keeps the whole
+# desktop crisp. When the user asks Telegram, or the viewer requests it, the
+# VM desktop itself is zoomed: the Windows Magnifier API first, otherwise
+# Ctrl+plus / Ctrl+minus / Ctrl+0 in the focused app.
+
+_zoom_state = {"percent": 100.0, "magnifier": False}
+_zoom_lock = threading.RLock()
+
+
+def _zoom_percent():
+    with _zoom_lock:
+        return _zoom_state["percent"]
+
+
+def _zoom_reset_state():
+    with _zoom_lock:
+        _zoom_state["percent"] = 100.0
+        _zoom_state["magnifier"] = False
+
+
+def _zoom_windows_magnifier(percent):
+    """Set the Windows Magnifier level (100 = normal) through its API."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        mag = ctypes.windll.Magnification
+        level = ctypes.c_float(percent / 100.0)
+        return bool(mag.MagSetFullscreenTransform(level, 0, 0))
+    except Exception as exc:
+        print(f"[zoom] magnifier {exc}")
+        return False
+
+
+def _zoom_set_percent(percent=None, direction=None, step=ZOOM_STEP, use_magnifier=True):
+    """Zoom the VM desktop. Returns the resulting percentage, or None."""
+    pyautogui = _ensure_pyautogui()
+    if not pyautogui:
+        return None
+    with _zoom_lock:
+        current = _zoom_state["percent"]
+    if percent is not None:
+        target = float(percent)
+    elif direction == "in":
+        target = current * step
+    elif direction == "out":
+        target = current / step
+    else:
+        target = 100.0
+    target = max(10.0, min(float(ZOOM_MAX), target))
+    steps = int(round(abs(target - current) / max(1.0, (step - 1.0) * 100.0)))
+    steps = max(1, min(60, steps)) if abs(target - current) >= 0.5 else 0
+    applied_api = False
+    if use_magnifier and platform.system() == "Windows":
+        applied_api = _zoom_windows_magnifier(target)
+    if not applied_api and steps:
+        # Windows apps use the numpad keys for Ctrl+plus / Ctrl+minus.
+        key_in, key_out = ("add", "subtract") if platform.system() == "Windows" else ("+", "-")
+        try:
+            if abs(target - 100.0) < 0.5:
+                pyautogui.hotkey("ctrl", "0")        # "actual size"
+            else:
+                key = key_in if target > current else key_out
+                for _ in range(steps):
+                    pyautogui.hotkey("ctrl", key)
+        except Exception as exc:
+            print(f"[zoom] {exc}")
+    with _zoom_lock:
+        _zoom_state["percent"] = target
+        _zoom_state["magnifier"] = applied_api
+    return round(target)
+
+
+def do_zoom(chat_id, args=""):
+    """Telegram entry point: `zoom in`, `zoom out`, `zoom 150`, `zoom reset`."""
+    arg = (args or "").strip().lower()
+    if arg in ("reset", "100", "off", "stop", "normal", "1", "fit"):
+        result = _zoom_set_percent(percent=100)
+        send_message(chat_id, "Desktop zoom reset to 100%." if result is not None
+                     else "Could not reset the desktop zoom (keyboard control unavailable).")
+        return True
+    if arg in ("", "in", "+", "up"):
+        result = _zoom_set_percent(direction="in")
+        send_message(chat_id, f"Desktop zoomed in to about {result}%." if result is not None
+                     else "Could not zoom in (keyboard control unavailable).")
+        return True
+    if arg in ("out", "-", "down"):
+        result = _zoom_set_percent(direction="out")
+        send_message(chat_id, f"Desktop zoomed out to about {result}%." if result is not None
+                     else "Could not zoom out (keyboard control unavailable).")
+        return True
+    try:
+        value = float(arg.rstrip("%"))
+    except ValueError:
+        send_message(chat_id, "Usage: `zoom in` / `zoom out` / `zoom 150` / `zoom reset`")
+        return True
+    result = _zoom_set_percent(percent=value)
+    send_message(chat_id, f"Desktop zoom set to about {result}%." if result is not None
+                 else "Could not change the desktop zoom (keyboard control unavailable).")
+    return True
+
+
 def livestream_status(chat_id):
     if not _remote_chat_allowed(chat_id):
         return True
@@ -1535,6 +1810,285 @@ def shutdown_remote_access():
         livestream_server.server_close()
 
 
+def create_desktop_app():
+    """Build the remote-desktop Flask app.
+
+    Flask, numpy, cv2 and mss are imported here rather than at module
+    import time, so the Telegram bot still starts (and the offline tests
+    still run) on a machine without the screen-capture stack installed.
+    """
+    global SCREEN_W, SCREEN_H
+    from flask import Flask, Response, request, jsonify
+    from werkzeug.serving import make_server
+    import numpy as np
+    import cv2
+    import mss
+
+    app = Flask(__name__)
+    # suppress flask logs
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+
+    # detect screen size once
+    try:
+        with mss.mss() as sct:
+            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            SCREEN_W = mon["width"]
+            SCREEN_H = mon["height"]
+    except:
+        pass
+
+    def capture_jpeg(width=854, quality=35):
+        monitor = mss.mss().monitors[1] if len(mss.mss().monitors) > 1 else mss.mss().monitors[0]
+        # we use fresh mss each time to avoid thread issues
+        with mss.mss() as sct:
+            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            sct_img = sct.grab(monitor)
+            frame = np.array(sct_img)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            h, w = frame.shape[:2]
+            new_h = int(h * (width / w))
+            frame_resized = cv2.resize(frame, (width, new_h))
+            _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            return buffer.tobytes(), w, h
+
+    def _clamp_stream_width(value, default=960):
+        # A zoomed-in viewer asks for more pixels; never let a request
+        # pick a size that would starve the CPU.
+        try:
+            width = int(float(value))
+        except (TypeError, ValueError):
+            return default
+        return max(480, min(1920, width))
+
+    def gen_frames(width=960, quality=40):
+        width = _clamp_stream_width(width)
+        quality = max(20, min(85, int(quality)))
+        while True:
+            try:
+                with mss.mss() as sct:
+                    monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                    sct_img = sct.grab(monitor)
+                    frame = np.array(sct_img)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    h, w = frame.shape[:2]
+                    new_w = min(width, w)
+                    new_h = int(h * (new_w / w))
+                    frame_resized = cv2.resize(frame, (new_w, new_h))
+                    _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                    frame_bytes = buffer.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n'
+                           b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n' +
+                           frame_bytes + b'\r\n')
+                time.sleep(0.12)
+            except Exception as e:
+                print(f"Frame gen error: {e}")
+                time.sleep(0.5)
+
+    @app.route("/")
+    def index():
+        # The viewer is its own file so touch handling stays readable.
+        # Never cached: a phone must not keep an old script that turned
+        # swipes into mouse drags (that selected text instead of
+        # scrolling).
+        try:
+            page = _desktop_client_html()
+        except FileNotFoundError:
+            return Response("desktop_client.html is missing next to runner.py",
+                            status=500, mimetype="text/plain")
+        return Response(page, mimetype="text/html", headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache", "Expires": "0",
+        })
+
+    @app.route("/snapshot")
+    def snapshot():
+        try:
+            data, w, h = capture_jpeg(width=_clamp_stream_width(request.args.get("w"), 960),
+                                      quality=35)
+            if data is None:
+                return Response("Capture failed", status=500)
+            return Response(data, mimetype='image/jpeg', headers={
+                'Cache-Control': 'no-store, no-cache, must-revalidate',
+                'Pragma': 'no-cache', 'Expires': '0'
+            })
+        except Exception as e:
+            return Response(f"Error: {e}", status=500)
+
+    @app.route("/stream")
+    def stream():
+        # ?w=<px> lets a zoomed-in viewer ask for a sharper picture;
+        # the default keeps the previous cost.
+        width = _clamp_stream_width(request.args.get("w"), 960)
+        quality = request.args.get("q", 40)
+        return Response(gen_frames(width, quality),
+                        mimetype='multipart/x-mixed-replace; boundary=frame',
+                        headers={'Cache-Control': 'no-store, no-cache, must-revalidate'})
+
+    @app.route("/info")
+    def info():
+        return jsonify({"width": SCREEN_W, "height": SCREEN_H})
+
+    @app.route("/input", methods=["POST"])
+    def input_route():
+        try:
+            data = request.get_json(force=True) or {}
+            action = (data.get("action") or "").lower()
+            pyautogui = _ensure_pyautogui()
+            if not pyautogui:
+                return jsonify({"ok": False, "error": "pyautogui missing"})
+            # Helper to convert ratio to coords
+            def to_coords(d):
+                # support both ratio and absolute
+                if "x_ratio" in d and "y_ratio" in d:
+                    x = int(float(d["x_ratio"]) * SCREEN_W)
+                    y = int(float(d["y_ratio"]) * SCREEN_H)
+                    return x, y
+                elif "x" in d and "y" in d:
+                    return int(d["x"]), int(d["y"])
+                else:
+                    return None, None
+            if action == "click":
+                x,y = to_coords(data)
+                if x is not None:
+                    pyautogui.click(x, y)
+                else:
+                    pyautogui.click()
+                return jsonify({"ok": True})
+            elif action == "rclick" or action == "rightclick":
+                x,y = to_coords(data)
+                if x is not None:
+                    pyautogui.rightClick(x, y)
+                else:
+                    pyautogui.rightClick()
+                return jsonify({"ok": True})
+            elif action in ("dblclick", "doubleclick", "double_click"):
+                x,y = to_coords(data)
+                if x is not None:
+                    pyautogui.doubleClick(x, y)
+                else:
+                    pyautogui.doubleClick()
+                return jsonify({"ok": True})
+            elif action == "move":
+                x,y = to_coords(data)
+                if x is not None:
+                    pyautogui.moveTo(x,y)
+                return jsonify({"ok": True})
+            elif action == "drag":
+                x,y = to_coords(data)
+                x2 = data.get("x2_ratio")
+                y2 = data.get("y2_ratio")
+                if x is not None and x2 is not None:
+                    x2i = int(float(x2) * SCREEN_W)
+                    y2i = int(float(y2) * SCREEN_H)
+                    pyautogui.moveTo(x,y, duration=0.05)
+                    pyautogui.dragTo(x2i, y2i, duration=0.4, button='left')
+                elif "x2" in data and "y2" in data:
+                    pyautogui.moveTo(x,y, duration=0.05)
+                    pyautogui.dragTo(int(data["x2"]), int(data["y2"]), duration=0.4)
+                return jsonify({"ok": True})
+            elif action == "scroll":
+                # Two forms:
+                #   {"amount": n}  -> n wheel notches (Telegram, older UI)
+                #   {"pixels": true, "dx": px, "dy": px}
+                #                  -> a swipe, replayed as real wheel notches
+                # A swipe must scroll like the wheel: no button is held
+                # and the pointer is not dragged, so it can never select
+                # text or move a window (that was the old bug).
+                if data.get("pixels"):
+                    _ensure_scroll_worker()
+                    steps = _scroll_flinger.feed(
+                        data.get("dx", 0), data.get("dy", 0),
+                        scale=_safe_scale(data.get("scale", 1.0)),
+                        reset=bool(data.get("reset")))
+                    if data.get("cursor") and "x_ratio" in data:
+                        # Optional: keep the pointer under the finger so
+                        # hover-sensitive apps react in the right place.
+                        cx, cy = to_coords(data)
+                        if cx is not None:
+                            try:
+                                pyautogui.moveTo(cx, cy, duration=0)
+                            except Exception:
+                                pass
+                    return jsonify({"ok": True, "queued": len(steps)})
+                try:
+                    amt = int(float(data.get("amount", 300)))
+                except (TypeError, ValueError):
+                    amt = 0
+                if amt:
+                    pyautogui.scroll(amt)
+                return jsonify({"ok": True})
+            elif action == "zoom":
+                # Desktop zoom on the VM. Pinching is normally handled
+                # locally by the browser; this is the explicit path.
+                percent = data.get("percent")
+                try:
+                    percent = float(percent) if percent is not None else None
+                except (TypeError, ValueError):
+                    percent = None
+                direction = (data.get("direction") or "").lower() or None
+                result = _zoom_set_percent(percent=percent, direction=direction)
+                return jsonify({"ok": result is not None, "percent": result})
+            elif action == "type":
+                text = data.get("text", "")
+                if text:
+                    # use clipboard for long text via helper but here simple
+                    if len(text) > 80 or any(ord(c)>127 for c in text):
+                        try:
+                            import pyperclip
+                            pyperclip.copy(text)
+                            pyautogui.hotkey('ctrl','v')
+                        except:
+                            pyautogui.write(text, interval=0.005)
+                    else:
+                        pyautogui.write(text, interval=0.01)
+                return jsonify({"ok": True})
+            elif action == "key":
+                keys = data.get("keys") or data.get("key") or ""
+                if keys:
+                    # single key press
+                    k = keys.lower().strip()
+                    # map arrow aliases
+                    if k in ("arrowup", "up"): pyautogui.press("up")
+                    elif k in ("arrowdown", "down"): pyautogui.press("down")
+                    elif k in ("arrowleft", "left"): pyautogui.press("left")
+                    elif k in ("arrowright", "right"): pyautogui.press("right")
+                    else: pyautogui.press(k)
+                return jsonify({"ok": True})
+            elif action == "hotkey":
+                keys = data.get("keys") or ""
+                if keys:
+                    parts = [p.strip().lower() for p in re.split(r'\+', keys) if p.strip()]
+                    # normalize
+                    mp = {"cmd":"win","super":"win","windows":"win","return":"enter","esc":"escape","del":"delete"}
+                    parts = [mp.get(p,p) for p in parts]
+                    pyautogui.hotkey(*parts)
+                return jsonify({"ok": True})
+            elif action == "press":
+                keys = data.get("keys") or data.get("key") or ""
+                if keys:
+                    if "+" in keys:
+                        parts = [p.strip() for p in keys.split("+")]
+                        pyautogui.hotkey(*parts)
+                    else:
+                        pyautogui.press(keys)
+                return jsonify({"ok": True})
+            else:
+                return jsonify({"ok": False, "error": f"unknown action {action}"})
+        except Exception as e:
+            print(f"input error {e}")
+            return jsonify({"ok": False, "error": str(e)})
+
+    @app.route("/stop-stream")
+    def stop_stream():
+        livestream_stop(notify=False)
+        return Response("Screen sharing and PhoneFS stopped", mimetype='text/plain')
+
+    return app
+
+
 @_serialize_remote_operation
 def livestream(chat_id):
     global livestream_url, livestream_active, livestream_stop_event
@@ -1564,436 +2118,10 @@ def livestream(chat_id):
         return
 
     def run_server():
-        global livestream_active, livestream_flask_started, livestream_server, SCREEN_W, SCREEN_H
+        global livestream_active, livestream_flask_started, livestream_server
         try:
-            from flask import Flask, Response, request, jsonify
             from werkzeug.serving import make_server
-            import numpy as np
-            import cv2
-            import mss
-
-            app = Flask(__name__)
-            # suppress flask logs
-            import logging
-            log = logging.getLogger('werkzeug')
-            log.setLevel(logging.ERROR)
-
-            # detect screen size once
-            try:
-                with mss.mss() as sct:
-                    mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                    SCREEN_W = mon["width"]
-                    SCREEN_H = mon["height"]
-            except:
-                pass
-
-            def capture_jpeg(width=854, quality=35):
-                monitor = mss.mss().monitors[1] if len(mss.mss().monitors) > 1 else mss.mss().monitors[0]
-                # we use fresh mss each time to avoid thread issues
-                with mss.mss() as sct:
-                    monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                    sct_img = sct.grab(monitor)
-                    frame = np.array(sct_img)
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                    h, w = frame.shape[:2]
-                    new_h = int(h * (width / w))
-                    frame_resized = cv2.resize(frame, (width, new_h))
-                    _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-                    return buffer.tobytes(), w, h
-
-            def gen_frames():
-                while True:
-                    try:
-                        with mss.mss() as sct:
-                            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                            sct_img = sct.grab(monitor)
-                            frame = np.array(sct_img)
-                            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                            h, w = frame.shape[:2]
-                            new_w = 960
-                            new_h = int(h * (new_w / w))
-                            frame_resized = cv2.resize(frame, (new_w, new_h))
-                            _, buffer = cv2.imencode(".jpg", frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
-                            frame_bytes = buffer.tobytes()
-                            yield (b'--frame\r\n'
-                                   b'Content-Type: image/jpeg\r\n'
-                                   b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n' +
-                                   frame_bytes + b'\r\n')
-                        time.sleep(0.12)
-                    except Exception as e:
-                        print(f"Frame gen error: {e}")
-                        time.sleep(0.5)
-
-            @app.route("/")
-            def index():
-                html = """<!DOCTYPE html>
-<html>
-<head>
-  <title>GitHub VM Remote Desktop</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{background:#0a0a0a;color:#eee;font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; min-height:100vh; display:flex; flex-direction:column}
-    header{background:#1a1a1a; padding:8px 12px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:10; border-bottom:1px solid #333}
-    header h1{font-size:14px; font-weight:600}
-    header .status{font-size:11px; color:#0f0}
-    #toolbar{background:#222; padding:6px; display:flex; gap:6px; flex-wrap:wrap; align-items:center; border-bottom:1px solid #333}
-    #toolbar button, #toolbar input{font-size:12px; padding:6px 10px; border-radius:6px; border:1px solid #444; background:#333; color:#fff}
-    #toolbar button:active{background:#555}
-    #toolbar input{background:#111; min-width:140px; flex:1}
-    #viewport{flex:1; display:flex; align-items:center; justify-content:center; background:#000; position:relative; overflow:hidden; touch-action:none}
-    #screen{max-width:100%; max-height: calc(100vh - 140px); width:auto; height:auto; display:block; cursor:crosshair; user-select:none; -webkit-user-drag:none}
-    #overlay{position:absolute; inset:0; pointer-events:none; display:flex; align-items:flex-start; justify-content:center; padding-top:6px}
-    #fps{font:11px monospace; background:rgba(0,0,0,0.7); color:#0f0; padding:3px 6px; border-radius:4px}
-    .keys{display:flex; gap:4px; flex-wrap:wrap}
-    .keys button{padding:5px 8px; font-size:11px}
-    .hint{font-size:10px; color:#888; padding:6px; text-align:center; background:#111}
-    .sep{width:1px; height:22px; background:#444; margin:0 2px}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>🖥️ GitHub VM Remote</h1>
-    <div class="status" id="st">Connecting...</div>
-  </header>
-  <div id="toolbar">
-    <input id="typeText" placeholder="Type text here & Send" />
-    <button onclick="sendType()">Send (Paste)</button>
-    <button onclick="sendKey('enter')">Enter</button>
-    <button onclick="sendKey('backspace')">⌫</button>
-    <button onclick="sendKey('tab')">Tab</button>
-    <button onclick="sendKey('escape')">Esc</button>
-    <div class="sep"></div>
-    <div class="keys">
-      <button onclick="sendHotkey('ctrl+c')">Ctrl+C</button>
-      <button onclick="sendHotkey('ctrl+v')">Ctrl+V</button>
-      <button onclick="sendHotkey('ctrl+a')">Ctrl+A</button>
-      <button onclick="sendHotkey('ctrl+z')">Ctrl+Z</button>
-      <button onclick="sendHotkey('alt+f4')">Alt+F4</button>
-      <button onclick="sendHotkey('win+r')">Win+R</button>
-      <button onclick="sendHotkey('win+d')">Win+D</button>
-    </div>
-    <div class="sep"></div>
-    <button onclick="sendKey('up')">↑</button>
-    <button onclick="sendKey('down')">↓</button>
-    <button onclick="sendKey('left')">←</button>
-    <button onclick="sendKey('right')">→</button>
-    <button onclick="location.reload()">↻</button>
-  </div>
-  <div id="viewport">
-    <img id="screen" src="/snapshot" alt="desktop" draggable="false">
-    <div id="overlay"><div id="fps">Live</div></div>
-  </div>
-  <div class="hint">Tap / Click image to click • Right-click for right-click • Drag to select/drag • Scroll with wheel / two fingers • Use text box to type • Keyboard works when focused</div>
-<script>
-let img = document.getElementById('screen');
-let st = document.getElementById('st');
-let fpsEl = document.getElementById('fps');
-let frames=0, lastT=Date.now(), errors=0, delay=500;
-let dragging=false, startX=0, startY=0;
-let screenW=1920, screenH=1080;
-
-// get screen size
-fetch('/info').then(r=>r.json()).then(j=>{screenW=j.width; screenH=j.height; st.textContent=`${screenW}x${screenH} | Live`})
-
-// MJPEG vs snapshot fallback: try mjpeg first
-let useMjpeg = true;
-let mjpegImg = new Image();
-let snapshotMode = false;
-
-function setupMjpeg(){
-  img.src = "/stream";
-  img.onerror = ()=>{ snapshotMode=true; console.log("mjpeg failed, falling to snapshot"); startSnapshot(); }
-  img.onload = ()=>{ st.textContent=`${screenW}x${screenH} | Live MJPEG`; }
-}
-function startSnapshot(){
-  snapshotMode=true;
-  img.src="/snapshot?t="+Date.now();
-  function load(){
-    let t=Date.now();
-    let nx=new Image();
-    nx.onload=function(){
-      if(snapshotMode){
-        img.src=nx.src;
-        errors=0;
-        if(delay>600) delay=600;
-        frames++;
-        let el=Date.now()-lastT;
-        if(el>=2000){ fpsEl.textContent=Math.round(frames*1000/el)+' FPS | Live'; st.textContent=`${screenW}x${screenH} | ${Math.round(frames*1000/el)} FPS`; frames=0; lastT=Date.now();}
-        setTimeout(load, Math.max(80, delay-(Date.now()-t)));
-      }
-    };
-    nx.onerror=function(){
-      errors++; fpsEl.textContent='Reconnecting... ('+errors+')'; st.textContent='Reconnecting...';
-      delay=Math.min(delay*1.4,4000);
-      setTimeout(load, Math.min(errors*600,3000));
-    };
-    nx.src='/snapshot?t='+t;
-  }
-  load();
-}
-// Try mjpeg with fallback after 3s if not loaded
-setupMjpeg();
-setTimeout(()=>{ if(img.naturalWidth==0){ startSnapshot(); } }, 2500);
-
-function getRatio(e){
-  let rect = img.getBoundingClientRect();
-  let x = (e.clientX - rect.left) / rect.width;
-  let y = (e.clientY - rect.top) / rect.height;
-  // clamp
-  x=Math.max(0,Math.min(1,x)); y=Math.max(0,Math.min(1,y));
-  return {x, y}
-}
-function postInput(data){
-  fetch('/input', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)}).catch(()=>{})
-}
-img.addEventListener('click', (e)=>{
-  if(dragging) return;
-  let r=getRatio(e);
-  postInput({action:'click', x_ratio:r.x, y_ratio:r.y})
-  // visual feedback
-  fpsEl.textContent=`Click ${(r.x*100).toFixed(1)}% ${(r.y*100).toFixed(1)}%`;
-  setTimeout(()=>fpsEl.textContent='Live',800)
-});
-img.addEventListener('contextmenu', (e)=>{
-  e.preventDefault();
-  let r=getRatio(e);
-  postInput({action:'rclick', x_ratio:r.x, y_ratio:r.y})
-  fpsEl.textContent='Right Click';
-  setTimeout(()=>fpsEl.textContent='Live',800)
-  return false;
-});
-img.addEventListener('dblclick', (e)=>{
-  let r=getRatio(e);
-  postInput({action:'dblclick', x_ratio:r.x, y_ratio:r.y})
-});
-img.addEventListener('mousedown', (e)=>{
-  if(e.button!==0) return;
-  dragging=true;
-  let r=getRatio(e);
-  startX=r.x; startY=r.y;
-});
-img.addEventListener('mouseup', (e)=>{
-  if(!dragging) return;
-  dragging=false;
-  let r=getRatio(e);
-  let dx=Math.abs(r.x-startX), dy=Math.abs(r.y-startY);
-  if(dx>0.02 || dy>0.02){
-    postInput({action:'drag', x_ratio:startX, y_ratio:startY, x2_ratio:r.x, y2_ratio:r.y})
-    fpsEl.textContent='Drag';
-  }
-});
-img.addEventListener('wheel', (e)=>{
-  e.preventDefault();
-  postInput({action:'scroll', amount: -Math.sign(e.deltaY)*300})
-},{passive:false});
-img.addEventListener('touchstart', (e)=>{
-  if(e.touches.length==1){
-    let t=e.touches[0];
-    let r=getRatio(t);
-    startX=r.x; startY=r.y;
-  }
-},{passive:true});
-img.addEventListener('touchend', (e)=>{
-  if(e.changedTouches.length==1){
-    let t=e.changedTouches[0];
-    let r=getRatio(t);
-    let dx=Math.abs(r.x-startX), dy=Math.abs(r.y-startY);
-    if(dx<0.02 && dy<0.02){
-      postInput({action:'click', x_ratio:r.x, y_ratio:r.y})
-    } else {
-      postInput({action:'drag', x_ratio:startX, y_ratio:startY, x2_ratio:r.x, y2_ratio:r.y})
-    }
-  }
-},{passive:true});
-
-// keyboard
-document.addEventListener('keydown', (e)=>{
-  // if typing in input, don't capture
-  if(document.activeElement.id==='typeText') return;
-  // avoid flooding
-  if(e.repeat) return;
-  let key = e.key.toLowerCase();
-  // map
-  if(key==='enter' || key==='tab' || key==='escape' || key==='backspace' || key==='delete' || key==='arrowup' || key==='arrowdown' || key==='arrowleft' || key==='arrowright'){
-    e.preventDefault();
-    let map={'arrowup':'up','arrowdown':'down','arrowleft':'left','arrowright':'right'};
-    postInput({action:'key', keys: map[key]||key})
-  } else if(e.ctrlKey || e.altKey || e.metaKey){
-    let combo=[];
-    if(e.ctrlKey) combo.push('ctrl');
-    if(e.altKey) combo.push('alt');
-    if(e.metaKey) combo.push('win');
-    if(key.length===1) combo.push(key);
-    else if(!['control','alt','meta','shift'].includes(key)) combo.push(key);
-    if(combo.length>1){
-      e.preventDefault();
-      postInput({action:'hotkey', keys: combo.join('+')})
-    }
-  } else if(key.length===1){
-    // single char typing via type action for reliability
-    // send as type 1 char? Instead send key press
-    // Use type for visible chars
-    postInput({action:'type', text:e.key})
-  }
-});
-
-function sendType(){
-  let el=document.getElementById('typeText');
-  let t=el.value;
-  if(!t) return;
-  postInput({action:'type', text:t});
-  el.value='';
-  fpsEl.textContent='Typed '+t.length+' chars';
-}
-function sendKey(k){ postInput({action:'key', keys:k}) }
-function sendHotkey(k){ postInput({action:'hotkey', keys:k}) }
-document.getElementById('typeText').addEventListener('keydown', (e)=>{
-  if(e.key==='Enter'){ e.preventDefault(); sendType(); }
-});
-</script>
-</body>
-</html>"""
-                return Response(html, mimetype='text/html')
-
-            @app.route("/snapshot")
-            def snapshot():
-                try:
-                    data, w, h = capture_jpeg(width=960, quality=35)
-                    if data is None:
-                        return Response("Capture failed", status=500)
-                    return Response(data, mimetype='image/jpeg', headers={
-                        'Cache-Control': 'no-store, no-cache, must-revalidate',
-                        'Pragma': 'no-cache', 'Expires': '0'
-                    })
-                except Exception as e:
-                    return Response(f"Error: {e}", status=500)
-
-            @app.route("/stream")
-            def stream():
-                return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-            @app.route("/info")
-            def info():
-                return jsonify({"width": SCREEN_W, "height": SCREEN_H})
-
-            @app.route("/input", methods=["POST"])
-            def input_route():
-                try:
-                    data = request.get_json(force=True) or {}
-                    action = (data.get("action") or "").lower()
-                    pyautogui = _ensure_pyautogui()
-                    if not pyautogui:
-                        return jsonify({"ok": False, "error": "pyautogui missing"})
-                    # Helper to convert ratio to coords
-                    def to_coords(d):
-                        # support both ratio and absolute
-                        if "x_ratio" in d and "y_ratio" in d:
-                            x = int(float(d["x_ratio"]) * SCREEN_W)
-                            y = int(float(d["y_ratio"]) * SCREEN_H)
-                            return x, y
-                        elif "x" in d and "y" in d:
-                            return int(d["x"]), int(d["y"])
-                        else:
-                            return None, None
-                    if action == "click":
-                        x,y = to_coords(data)
-                        if x is not None:
-                            pyautogui.click(x, y)
-                        else:
-                            pyautogui.click()
-                        return jsonify({"ok": True})
-                    elif action == "rclick" or action == "rightclick":
-                        x,y = to_coords(data)
-                        if x is not None:
-                            pyautogui.rightClick(x, y)
-                        else:
-                            pyautogui.rightClick()
-                        return jsonify({"ok": True})
-                    elif action in ("dblclick", "doubleclick", "double_click"):
-                        x,y = to_coords(data)
-                        if x is not None:
-                            pyautogui.doubleClick(x, y)
-                        else:
-                            pyautogui.doubleClick()
-                        return jsonify({"ok": True})
-                    elif action == "move":
-                        x,y = to_coords(data)
-                        if x is not None:
-                            pyautogui.moveTo(x,y)
-                        return jsonify({"ok": True})
-                    elif action == "drag":
-                        x,y = to_coords(data)
-                        x2 = data.get("x2_ratio")
-                        y2 = data.get("y2_ratio")
-                        if x is not None and x2 is not None:
-                            x2i = int(float(x2) * SCREEN_W)
-                            y2i = int(float(y2) * SCREEN_H)
-                            pyautogui.moveTo(x,y, duration=0.05)
-                            pyautogui.dragTo(x2i, y2i, duration=0.4, button='left')
-                        elif "x2" in data and "y2" in data:
-                            pyautogui.moveTo(x,y, duration=0.05)
-                            pyautogui.dragTo(int(data["x2"]), int(data["y2"]), duration=0.4)
-                        return jsonify({"ok": True})
-                    elif action == "scroll":
-                        amt = int(data.get("amount", 300))
-                        pyautogui.scroll(amt)
-                        return jsonify({"ok": True})
-                    elif action == "type":
-                        text = data.get("text", "")
-                        if text:
-                            # use clipboard for long text via helper but here simple
-                            if len(text) > 80 or any(ord(c)>127 for c in text):
-                                try:
-                                    import pyperclip
-                                    pyperclip.copy(text)
-                                    pyautogui.hotkey('ctrl','v')
-                                except:
-                                    pyautogui.write(text, interval=0.005)
-                            else:
-                                pyautogui.write(text, interval=0.01)
-                        return jsonify({"ok": True})
-                    elif action == "key":
-                        keys = data.get("keys") or data.get("key") or ""
-                        if keys:
-                            # single key press
-                            k = keys.lower().strip()
-                            # map arrow aliases
-                            if k in ("arrowup", "up"): pyautogui.press("up")
-                            elif k in ("arrowdown", "down"): pyautogui.press("down")
-                            elif k in ("arrowleft", "left"): pyautogui.press("left")
-                            elif k in ("arrowright", "right"): pyautogui.press("right")
-                            else: pyautogui.press(k)
-                        return jsonify({"ok": True})
-                    elif action == "hotkey":
-                        keys = data.get("keys") or ""
-                        if keys:
-                            parts = [p.strip().lower() for p in re.split(r'\+', keys) if p.strip()]
-                            # normalize
-                            mp = {"cmd":"win","super":"win","windows":"win","return":"enter","esc":"escape","del":"delete"}
-                            parts = [mp.get(p,p) for p in parts]
-                            pyautogui.hotkey(*parts)
-                        return jsonify({"ok": True})
-                    elif action == "press":
-                        keys = data.get("keys") or data.get("key") or ""
-                        if keys:
-                            if "+" in keys:
-                                parts = [p.strip() for p in keys.split("+")]
-                                pyautogui.hotkey(*parts)
-                            else:
-                                pyautogui.press(keys)
-                        return jsonify({"ok": True})
-                    else:
-                        return jsonify({"ok": False, "error": f"unknown action {action}"})
-                except Exception as e:
-                    print(f"input error {e}")
-                    return jsonify({"ok": False, "error": str(e)})
-
-            @app.route("/stop-stream")
-            def stop_stream():
-                livestream_stop(notify=False)
-                return Response("Screen sharing and PhoneFS stopped", mimetype='text/plain')
-
+            app = create_desktop_app()
             with livestream_lock:
                 if stop_event.is_set() or stop_event is not livestream_stop_event:
                     return
@@ -2040,6 +2168,7 @@ WELCOME = (
     "- `move 800 500` - Move mouse\n"
     "- `drag 100 100 500 500` - Drag\n"
     "- `scroll up 500` / `scroll down 500` / `scroll 300`\n"
+    "- `zoom in` / `zoom out` / `zoom 150` / `zoom reset` - Zoom the VM desktop\n"
     "- `pos` - Show mouse position & screen size\n\n"
     "*📁 Files:*\n"
     "- `pwd` / `ls [path]` / `cat <file>` / `get <file>` (send file)\n"
@@ -2299,6 +2428,10 @@ def main():
                 if text.startswith("scroll ") or text.startswith("wheel ") or text == "scroll" or text == "wheel":
                     arg = orig_text.split(" ",1)[1] if " " in orig_text else ""
                     do_mouse(chat_id, "scroll", arg)
+                    continue
+                if text == "zoom" or text.startswith("zoom "):
+                    arg = orig_text.split(" ", 1)[1] if " " in orig_text else ""
+                    do_zoom(chat_id, arg)
                     continue
                 if text in ("holdmouse", "mousedown", "mouseup", "releasemouse"):
                     if text in ("holdmouse", "mousedown"):
