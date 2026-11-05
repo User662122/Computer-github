@@ -1604,6 +1604,12 @@ def _desktop_client_html():
 # pyautogui.scroll() counts clicks. A swipe is pixel-based, so these constants
 # decide how far one notch moves the page.
 WHEEL_DELTA = 120
+# PyAutoGUI hands its `clicks` argument straight to mouse_event()'s dwData, and
+# Windows only turns the wheel for multiples of WHEEL_DELTA (120). Passing the
+# notch count itself (1..8 here) is one 120th of a notch, which Windows drops
+# without any error -- that is why swiping never scrolled anything even though
+# the requests succeeded. Other platforms take line counts, so they use 1.
+WHEEL_UNITS_PER_NOTCH = WHEEL_DELTA if sys.platform.startswith("win") else 1
 DESKTOP_NOTCH_PIXELS = 100.0   # desktop pixels scrolled by one wheel notch
 WHEEL_ACCEL_PIXELS = 900.0     # fast flicks get a little extra distance
 WHEEL_MAX_NOTCHES = 8          # cap per request so a flick stays smooth
@@ -1699,6 +1705,23 @@ def _safe_scale(value, default=1.0):
     return max(0.25, min(4.0, scale))
 
 
+def _wheel_units(notches):
+    """Convert wheel notches into the units the platform's wheel call expects.
+
+    Windows measures wheel movement in WHEEL_DELTA (120) units and PyAutoGUI
+    forwards the value untouched, so a notch count has to be scaled up before
+    it reaches mouse_event(): 1, 2 or 8 on their own are a fraction of a notch
+    and Windows silently ignores them (this is what made swipes do nothing).
+    """
+    try:
+        count = int(notches)
+    except (TypeError, ValueError):
+        return 0
+    if not count:
+        return 0
+    return count * WHEEL_UNITS_PER_NOTCH
+
+
 def _scroll_wheel_worker(flinger):
     """Replay queued steps as wheel events, never blocking the HTTP handler.
 
@@ -1720,10 +1743,12 @@ def _scroll_wheel_worker(flinger):
                 if nx and hasattr(pyautogui, "hscroll"):
                     # Horizontal swipes scroll sideways; combined with a
                     # vertical step this is a diagonal swipe.
-                    pyautogui.hscroll(nx)
+                    pyautogui.hscroll(_wheel_units(nx))
                 if ny:
                     # pyautogui: positive scrolls up, negative scrolls down.
-                    pyautogui.scroll(ny)
+                    # The notch count is scaled to wheel units here: bare
+                    # notches are below WHEEL_DELTA and Windows drops them.
+                    pyautogui.scroll(_wheel_units(ny))
             except Exception as exc:      # keep the worker alive
                 print(f"[scroll] {exc}")
                 time.sleep(0.05)

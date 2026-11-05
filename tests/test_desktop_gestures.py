@@ -287,6 +287,30 @@ class InputRouteTests(unittest.TestCase):
         self.assertEqual(self.gui.mouse_button_names(), [],
                          "scrolling must not press a mouse button")
 
+    def test_swipe_wheel_values_are_scaled_to_wheel_delta_units(self):
+        # PyAutoGUI forwards its argument untouched to mouse_event()'s dwData,
+        # and Windows only turns the wheel for multiples of WHEEL_DELTA (120).
+        # Sending the bare notch count (the flinger caps at 8) is a fraction of
+        # a notch, so Windows dropped every swipe without raising an error and
+        # scrolling looked dead while every request still answered {"ok":true}.
+        with mock.patch.object(runner, "WHEEL_UNITS_PER_NOTCH", 120):
+            self.post({"action": "scroll", "pixels": True, "dx": 0, "dy": -300,
+                       "reset": True})
+            self._drain()
+            scrolls = [value for name, value in self.gui.calls if name == "scroll"]
+        self.assertTrue(scrolls, "a swipe must still produce wheel events")
+        self.assertLess(min(scrolls), 0, "the sign must survive the scaling")
+        self.assertTrue(all(value % 120 == 0 for value in scrolls),
+                        "wheel values must be whole WHEEL_DELTA steps: %r" % (scrolls,))
+
+    def test_wheel_units_helper_scales_and_tolerates_garbage(self):
+        with mock.patch.object(runner, "WHEEL_UNITS_PER_NOTCH", 120):
+            self.assertEqual(runner._wheel_units(3), 360)
+            self.assertEqual(runner._wheel_units(-3), -360)
+            self.assertEqual(runner._wheel_units(0), 0)
+            self.assertEqual(runner._wheel_units(None), 0)
+            self.assertEqual(runner._wheel_units("nonsense"), 0)
+
     def test_horizontal_swipe_uses_hscroll_when_available(self):
         self.post({"action": "scroll", "pixels": True, "dx": -400, "dy": 0, "reset": True})
         import time
