@@ -1351,6 +1351,73 @@ def _remote_chat_allowed(chat_id, claim=False):
     return allowed
 
 
+# A quick tunnel's public URL is printed before Cloudflare can route to the
+# connector. Announcing it at that instant is what made a link show a 502 (or a
+# dead connection) on the phone even though the VM was sharing fine. The URL is
+# therefore only handed to Telegram after it actually answers through the
+# public hostname, and the same check keeps running afterwards so a link that
+# stops working is replaced instead of being left in the chat.
+TUNNEL_READY_TIMEOUT = 160.0     # per URL: wait for the hostname to answer
+TUNNEL_READY_INTERVAL = 2.0      # between readiness probes
+TUNNEL_PROBE_TIMEOUT = 5.0       # one HEAD request
+TUNNEL_HEALTH_INTERVAL = 45.0    # liveness checks once the link is live
+TUNNEL_MAX_DEAD_CHECKS = 4       # consecutive failures before the link is replaced
+TUNNEL_FAILURES_BEFORE_NOTICE = 3  # failed launches before the chat is told
+
+
+def _probe_screen_url(url, timeout=TUNNEL_PROBE_TIMEOUT):
+    """Fetch ``url`` and report (works, why not).
+
+    A quick tunnel can be perfectly healthy locally while its hostname still
+    answers 502/530 or drops the TLS handshake. Only the viewer page proves the
+    whole path (Cloudflare edge, connector, port 5000) works, and only a
+    marker rendered by this code proves the answer came from *our* server and
+    not from another host that reuses the quick-tunnel hostname.
+    """
+    url = (url or "").strip()
+    if not url:
+        return False, "no URL"
+    try:
+        response = requests.get(url, timeout=timeout, allow_redirects=True,
+                                headers={"User-Agent": "telegram-code-runner/probe"})
+    except Exception as exc:          # 502/530 and a broken handshake land here
+        return False, f"no answer from Cloudflare ({exc.__class__.__name__})"
+    if response.status_code != 200:
+        return False, f"HTTP {response.status_code}"
+    if "GitHub-VM-Remote-Desktop" not in (response.text or ""):
+        return False, "answered, but not with this viewer"
+    return True, "reachable"
+
+
+def _tunnel_probe(url, timeout=TUNNEL_PROBE_TIMEOUT):
+    """Boolean form used by the health loop and the status command."""
+    return _probe_screen_url(url, timeout=timeout)[0]
+
+
+def _wait_for_tunnel(process, url, stop_event, timeout=TUNNEL_READY_TIMEOUT):
+    """Wait until the public URL answers, it dies, or the session stops."""
+    deadline = time.monotonic() + timeout
+    while not stop_event.is_set():
+        if process is not None and process.poll() is not None:
+            return False, f"cloudflared exited ({process.poll()})"
+        if _tunnel_probe(url):
+            return True, None
+        if time.monotonic() >= deadline:
+            break
+        stop_event.wait(TUNNEL_READY_INTERVAL)     # never a bare sleep: stop is instant
+    return False, _probe_screen_url(url)[1]
+
+
+def _announce_screen_url(chat_id, url):
+    send_message(chat_id,
+        f"Screen sharing online (local port 5000): {url}\n"
+        "Open on phone/PC for full mouse and keyboard control.\n"
+        "The link was checked from the public internet, so it should load on the first try.\n"
+        "If you ever see a 502 or a stuck page, wait a few seconds and refresh; "
+        "the link is also re-checked automatically.\n\n"
+        + phonefs_service.status_text(chat_id), parse_mode=None)
+
+
 def _start_desktop_tunnel(chat_id, stop_event):
     global livestream_tunnel_thread
     with livestream_lock:
@@ -1370,11 +1437,11 @@ def run_tunnel_with_autorestart(chat_id, stop_event):
     global livestream_proc, livestream_url
     import queue
     attempt = 0
+    failures = 0
     while not stop_event.is_set():
         attempt += 1
         process = None
         logs = []
-        url_sent = False
         try:
             for _ in range(15):
                 if stop_event.is_set():
@@ -1422,8 +1489,11 @@ def run_tunnel_with_autorestart(chat_id, stop_event):
                     output_queue.put(None)
 
             threading.Thread(target=pump, args=(process.stdout, output), daemon=True).start()
+
+            url = None
             deadline = time.monotonic() + 40
-            while not stop_event.is_set():
+            # Phase 1: cloudflared has to print a quick-tunnel hostname.
+            while not stop_event.is_set() and url is None:
                 try:
                     line = output.get(timeout=0.5)
                 except queue.Empty:
@@ -1435,29 +1505,64 @@ def run_tunnel_with_autorestart(chat_id, stop_event):
                     # The screen URL itself grants control; raw cloudflared
                     # output belongs only in the owning chat's diagnostics.
                     match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', clean)
-                    if match and not url_sent and process.poll() is None:
-                        with livestream_lock:
-                            if stop_event.is_set() or stop_event is not livestream_stop_event:
-                                return
-                            livestream_url = match.group(0)
-                            url_sent = True
-                            print("[screen tunnel] URL obtained; notifying the owning Telegram chat", flush=True)
-                            send_message(chat_id,
-                                f"Screen sharing online (local port 5000): {livestream_url}\n"
-                                "Open on phone/PC for full mouse and keyboard control.\n"
-                                "If the page initially shows 502, wait a few seconds and refresh.\n\n"
-                                + phonefs_service.status_text(chat_id), parse_mode=None)
+                    if match and process.poll() is None:
+                        url = match.group(0)
+                        print("[screen tunnel] URL obtained; verifying it from the outside", flush=True)
+                        break
                 code = process.poll()
                 if code is not None:
                     raise RuntimeError(f"Screen tunnel disconnected (exit {code})")
-                if not url_sent and time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     raise RuntimeError("No screen tunnel URL after 40 seconds")
+
+            # Phase 2: the hostname is printed, not necessarily reachable. Only
+            # announce a link that answers through Cloudflare, otherwise the
+            # phone opens a 502/stuck page (the symptom users report).
+            ready, why = _wait_for_tunnel(process, url, stop_event)
+            if not ready:
+                raise RuntimeError(f"Screen link {url} is not reachable ({why})")
+            with livestream_lock:
+                if stop_event.is_set() or stop_event is not livestream_stop_event:
+                    return
+                livestream_url = url
+                failures = 0
+                print("[screen tunnel] Link verified; notifying the owning Telegram chat", flush=True)
+                _announce_screen_url(chat_id, livestream_url)
+
+            # Phase 3: keep watching the public link. A quick tunnel can lose its
+            # connector (network hiccup, Cloudflare eviction) while the process
+            # stays alive; without this the chat would keep a dead link.
+            misses = 0
+            while not stop_event.is_set():
+                deadline = time.monotonic() + TUNNEL_HEALTH_INTERVAL
+                while not stop_event.is_set() and time.monotonic() < deadline:
+                    if not output.empty():        # drain so the pipe cannot fill
+                        try:
+                            output.get_nowait()
+                        except queue.Empty:
+                            pass
+                    code = process.poll()
+                    if code is not None:
+                        raise RuntimeError(f"Screen tunnel disconnected (exit {code})")
+                    if stop_event.wait(1):
+                        return
+                if process.poll() is not None:
+                    raise RuntimeError("Screen tunnel disconnected during health check")
+                if _tunnel_probe(url):
+                    misses = 0                # one good answer clears the streak
+                    continue
+                misses += 1
+                if misses >= TUNNEL_MAX_DEAD_CHECKS:
+                    raise RuntimeError(f"Screen link {url} stopped answering; opening a new one")
         except Exception as exc:
             if not stop_event.is_set():
+                failures += 1
                 detail = "\n".join(logs)[-1800:]
-                send_message(chat_id,
-                    f"Screen tunnel: {exc}. Retrying (attempt {attempt}).\n{detail}\n"
-                    "PhoneFS is independent. Use livestream status for both services.", parse_mode=None)
+                if failures <= TUNNEL_FAILURES_BEFORE_NOTICE:
+                    send_message(chat_id,
+                        f"Screen tunnel: {exc}. Retrying (attempt {attempt}).\n{detail}\n"
+                        "PhoneFS is independent. Use livestream status for both services.", parse_mode=None)
+                print(f"[screen tunnel] attempt {attempt} failed: {exc}", flush=True)
         finally:
             terminate_process_tree(process)
             if process and process.stdout:
@@ -1499,6 +1604,12 @@ def _desktop_client_html():
 # pyautogui.scroll() counts clicks. A swipe is pixel-based, so these constants
 # decide how far one notch moves the page.
 WHEEL_DELTA = 120
+# PyAutoGUI hands its `clicks` argument straight to mouse_event()'s dwData, and
+# Windows only turns the wheel for multiples of WHEEL_DELTA (120). Passing the
+# notch count itself (1..8 here) is one 120th of a notch, which Windows drops
+# without any error -- that is why swiping never scrolled anything even though
+# the requests succeeded. Other platforms take line counts, so they use 1.
+WHEEL_UNITS_PER_NOTCH = WHEEL_DELTA if sys.platform.startswith("win") else 1
 DESKTOP_NOTCH_PIXELS = 100.0   # desktop pixels scrolled by one wheel notch
 WHEEL_ACCEL_PIXELS = 900.0     # fast flicks get a little extra distance
 WHEEL_MAX_NOTCHES = 8          # cap per request so a flick stays smooth
@@ -1594,6 +1705,23 @@ def _safe_scale(value, default=1.0):
     return max(0.25, min(4.0, scale))
 
 
+def _wheel_units(notches):
+    """Convert wheel notches into the units the platform's wheel call expects.
+
+    Windows measures wheel movement in WHEEL_DELTA (120) units and PyAutoGUI
+    forwards the value untouched, so a notch count has to be scaled up before
+    it reaches mouse_event(): 1, 2 or 8 on their own are a fraction of a notch
+    and Windows silently ignores them (this is what made swipes do nothing).
+    """
+    try:
+        count = int(notches)
+    except (TypeError, ValueError):
+        return 0
+    if not count:
+        return 0
+    return count * WHEEL_UNITS_PER_NOTCH
+
+
 def _scroll_wheel_worker(flinger):
     """Replay queued steps as wheel events, never blocking the HTTP handler.
 
@@ -1615,10 +1743,12 @@ def _scroll_wheel_worker(flinger):
                 if nx and hasattr(pyautogui, "hscroll"):
                     # Horizontal swipes scroll sideways; combined with a
                     # vertical step this is a diagonal swipe.
-                    pyautogui.hscroll(nx)
+                    pyautogui.hscroll(_wheel_units(nx))
                 if ny:
                     # pyautogui: positive scrolls up, negative scrolls down.
-                    pyautogui.scroll(ny)
+                    # The notch count is scaled to wheel units here: bare
+                    # notches are below WHEEL_DELTA and Windows drops them.
+                    pyautogui.scroll(_wheel_units(ny))
             except Exception as exc:      # keep the worker alive
                 print(f"[scroll] {exc}")
                 time.sleep(0.05)
@@ -1752,11 +1882,19 @@ def livestream_status(chat_id):
         return True
     port_ok = _is_port_open(5000)
     proc_ok = livestream_proc is not None and livestream_proc.poll() is None
+    url = livestream_url
+    # "Tunnel alive" only means cloudflared is running; the link itself can
+    # still be unreachable from the internet, so probe it like a phone would.
+    if url:
+        public = "reachable" if _tunnel_probe(url) else "NOT reachable right now"
+    else:
+        public = "connecting" if livestream_active else "stopped"
     send_message(chat_id,
         f"Screen sharing status:\n- Active: {livestream_active}\n"
         f"- Web server: {livestream_flask_started} (port 5000 open={port_ok})\n"
-        f"- Tunnel alive: {proc_ok}\n"
-        f"- Screen URL: {livestream_url or ('connecting' if livestream_active else 'stopped')}\n"
+        f"- Tunnel process alive: {proc_ok}\n"
+        f"- Public link from the internet: {public}\n"
+        f"- Screen URL: {url or ('connecting' if livestream_active else 'stopped')}\n"
         f"- Screen: {SCREEN_W}x{SCREEN_H}\n\n"
         + phonefs_service.status_text(chat_id), parse_mode=None)
     return True
@@ -2062,6 +2200,11 @@ def create_desktop_app():
         except FileNotFoundError:
             return Response("desktop_client.html is missing next to runner.py",
                             status=500, mimetype="text/plain")
+        # Rendered at request time so the tunnel readiness probe can prove the
+        # answer came from this screen server (and not from some other host
+        # reusing the quick-tunnel hostname).
+        page = page.replace("<!--GitHub-VM-Remote-Desktop-->",
+                            "<!--GitHub-VM-Remote-Desktop " + str(time.time()) + "-->")
         return Response(page, mimetype="text/html", headers={
             "Cache-Control": "no-store, no-cache, must-revalidate",
             "Pragma": "no-cache", "Expires": "0",
@@ -2070,8 +2213,10 @@ def create_desktop_app():
     @app.route("/snapshot")
     def snapshot():
         try:
-            data, w, h = capture_jpeg(width=_clamp_stream_width(request.args.get("w"), 960),
-                                      quality=35)
+            # One JPEG of the current desktop (used by the viewer's fallback
+            # and by anything that wants a still image), not the delta stream.
+            data, w, h = take_screenshot_bytes(quality=35,
+                                               width=_clamp_stream_width(request.args.get("w"), 960))
             if data is None:
                 return Response("Capture failed", status=500)
             return Response(data, mimetype='image/jpeg', headers={
@@ -2152,23 +2297,20 @@ def create_desktop_app():
                 # and the pointer is not dragged, so it can never select
                 # text or move a window (that was the old bug).
                 if data.get("pixels"):
+                    # A swipe is a wheel gesture, not a pointer drag: the
+                    # mouse must stay where the user left it. Moving it here
+                    # (as the previous build did, so the wheel landed under
+                    # the finger) made the pointer race up and down the screen
+                    # during every swipe, which also changed what the wheel
+                    # scrolled. The viewer now parks the pointer once, when
+                    # the finger touches down (action "pointer").
                     _ensure_scroll_worker()
-                    # A wheel notch goes to the window under the pointer, so
-                    # move the pointer under the finger first. Without this a
-                    # swipe scrolled whatever window the mouse was left on
-                    # (often none), which is why scrolling felt broken.
-                    cx, cy = to_coords(data)
                     with _scroll_target_lock:
-                        if cx is not None:
-                            try:
-                                pyautogui.moveTo(cx, cy, duration=0)
-                            except Exception as exc:
-                                print(f"[scroll] move {exc}")
                         queued = _scroll_flinger.feed(
                             data.get("dx", 0), data.get("dy", 0),
                             scale=_safe_scale(data.get("scale", 1.0)),
                             reset=bool(data.get("reset")))
-                    return jsonify({"ok": True, "queued": len(queued), "at": [cx, cy]})
+                    return jsonify({"ok": True, "queued": len(queued)})
                 try:
                     amt = int(float(data.get("amount", 300)))
                 except (TypeError, ValueError):
@@ -2176,6 +2318,22 @@ def create_desktop_app():
                 if amt:
                     pyautogui.scroll(amt)
                 return jsonify({"ok": True})
+            elif action in ("pointer", "move"):
+                # Park the pointer under the finger once per gesture (the
+                # viewer sends this on touch-down). A wheel event is
+                # delivered to the window under the pointer, so the pointer
+                # has to be in the right place *before* the first notch --
+                # but it must not follow the swipe afterwards.
+                cx, cy = to_coords(data)
+                if cx is None:
+                    return jsonify({"ok": False, "error": "pointer needs x/y"})
+                with _scroll_target_lock:
+                    try:
+                        pyautogui.moveTo(cx, cy, duration=0)
+                    except Exception as exc:
+                        print(f"[pointer] move {exc}")
+                        return jsonify({"ok": False, "error": str(exc)})
+                return jsonify({"ok": True, "at": [cx, cy]})
             elif action == "zoom":
                 # Desktop zoom on the VM. Pinching is normally handled
                 # locally by the browser; this is the explicit path.

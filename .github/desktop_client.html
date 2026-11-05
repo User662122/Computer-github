@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<!--GitHub-VM-Remote-Desktop-->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -150,7 +151,11 @@ function flash(msg){
 
 // ---- view math ----------------------------------------------------
 function computeFit(){
-  var s = Math.min(vpW() / screenW, vpH() / screenH);
+  // The picture (and the stage) is drawn in *frame* pixels, not desktop
+  // pixels, so fit against the delta picture. Using the desktop size here
+  // made a fitted phone view half size and made swipes scroll twice as far
+  // as the finger moved.
+  var s = Math.min(vpW() / frameW, vpH() / frameH);
   if (!isFinite(s) || s <= 0) s = 1;
   fitScale = Math.min(s, 1);
 }
@@ -159,7 +164,7 @@ function minZoom(){ return fitScale * MIN_FIT_FACTOR; }
 
 function clampPan(){
   var w = vpW(), h = vpH();
-  var cw = screenW * zoom, ch = screenH * zoom;
+  var cw = frameW * zoom, ch = frameH * zoom;
   if (cw <= w + 0.5) panX = (w - cw) / 2; else panX = clamp(panX, w - cw, 0);
   if (ch <= h + 0.5) panY = (h - ch) / 2; else panY = clamp(panY, h - ch, 0);
 }
@@ -213,16 +218,34 @@ function ratioAt(clientX, clientY){
 /* ---- scroll pipeline --------------------------------------------- *
  * Swipe pixels are accumulated and pushed to the VM as mouse wheel
  * notches (the server keeps the sub-notch remainder), so a swipe feels
- * like rolling the wheel instead of dragging the mouse. The pointer is
- * sent along so the wheel lands on the window under the finger.        */
-var scrollQueue = {dx: 0, dy: 0, x: 0.5, y: 0.5, needReset: false, resetSent: true,
+ * like rolling the wheel instead of dragging the mouse.
+ *
+ * The wheel goes to whatever window is under the VM pointer, so the
+ * pointer is parked under the finger exactly once, on touch-down. It is
+ * never moved per scroll step: doing that (previous build) made the
+ * pointer race up and down the screen while a swipe was in progress.  */
+var scrollQueue = {dx: 0, dy: 0, needReset: false, resetSent: true,
                    timer: 0, busy: false, watchdog: 0};
 
-function queueScroll(dxPixels, dyPixels, ratio){
+// A wheel request carries no position at all: the pointer was parked once,
+// when the gesture started, and must not move while the wheel turns.
+function queueScroll(dxPixels, dyPixels){
   scrollQueue.dx += dxPixels;
   scrollQueue.dy += dyPixels;
-  if (ratio){ scrollQueue.x = ratio.x; scrollQueue.y = ratio.y; }
   scheduleScroll();
+}
+// Park the VM pointer under a touch so the wheel lands in the right
+// window. Called once per gesture (touch-down), never while swiping, and
+// the gesture's first wheel request waits for it so the notch cannot land
+// in the window the pointer happened to be over before.
+function parkPointer(ratio){
+  if (!ratio){ scrollQueue.resetSent = true; return; }
+  scrollQueue.resetSent = false;          // hold the wheel until it lands
+  postInput({action: 'pointer', x_ratio: ratio.x, y_ratio: ratio.y})
+    .then(function(){
+      scrollQueue.resetSent = true;
+      if (scrollQueue.dx || scrollQueue.dy) scheduleScroll();
+    });
 }
 function scheduleScroll(){
   if (scrollQueue.timer || scrollQueue.busy) return;
@@ -231,6 +254,12 @@ function scheduleScroll(){
 function flushScroll(){
   if (scrollQueue.timer){ clearTimeout(scrollQueue.timer); scrollQueue.timer = 0; }
   if (scrollQueue.busy) return;
+  if (!scrollQueue.resetSent){
+    // The pointer is still being parked under the finger; a notch sent now
+    // would scroll whatever window the pointer was left on.
+    scrollQueue.timer = setTimeout(flushScroll, SWIPE_SEND_MS);
+    return;
+  }
   var dx = scrollQueue.dx, dy = scrollQueue.dy, reset = scrollQueue.needReset;
   if (!dx && !dy && !reset) return;
   scrollQueue.dx = 0; scrollQueue.dy = 0; scrollQueue.needReset = false;
@@ -238,8 +267,7 @@ function flushScroll(){
   scrollQueue.busy = true;
   clearTimeout(scrollQueue.watchdog);
   scrollQueue.watchdog = setTimeout(function(){ scrollQueue.busy = false; }, 1500);
-  postInput({action: 'scroll', pixels: true, dx: dx, dy: dy, reset: reset,
-             x_ratio: scrollQueue.x, y_ratio: scrollQueue.y})
+  postInput({action: 'scroll', pixels: true, dx: dx, dy: dy, reset: reset})
     .then(function(){
       clearTimeout(scrollQueue.watchdog);
       scrollQueue.busy = false;
@@ -309,6 +337,9 @@ function onPointerDown(e){
   if (pointers.size === 1){
     pinch = null;
     startSingle(e);
+    // One wheel gesture is about to start here; put the pointer under the
+    // finger so the notches scroll this window, not the last one used.
+    if (swipeMode !== 'pan') parkPointer(ratioAt(e.clientX, e.clientY));
   } else if (pointers.size === 2){
     clearLongPress();
     if (single) single.mode = single.mode || 'twofinger';
@@ -328,8 +359,10 @@ function onPointerMove(e){
     if (moved < TAP_MOVE_PX) return;
     clearLongPress();
     single.mode = (swipeMode === 'pan') ? 'pan' : 'scroll';
-    single.lastX = e.clientX; single.lastY = e.clientY;
-    if (single.mode === 'scroll' && !scrollQueue.resetSent) scrollQueue.needReset = true;
+    // Follow the finger from the moment the swipe is recognised (the first
+    // few pixels only decide scroll-vs-tap), so nothing is lost and the
+    // deltas stay gesture-relative instead of jumping to an absolute point.
+    single.lastX = single.startX; single.lastY = single.startY;
     return;
   }
   var stepX = e.clientX - single.lastX;
@@ -337,7 +370,10 @@ function onPointerMove(e){
   if (!stepX && !stepY) return;
   single.lastX = e.clientX; single.lastY = e.clientY;
   if (single.mode === 'scroll'){
-    queueScroll(stepX / zoom, stepY / zoom, ratioAt(e.clientX, e.clientY));
+    // The wheel is measured in desktop pixels, the finger moves in picture
+    // pixels: one picture pixel is screenW/frameW desktop pixels.
+    var unit = screenW / Math.max(1, frameW);
+    queueScroll(stepX * unit / zoom, stepY * unit / zoom);
   } else if (single.mode === 'pan'){
     panX += stepX; panY += stepY;
     clampPan();
@@ -372,8 +408,11 @@ function endPointer(e, cancelled){
     single = null;
   }
   if (scrollQueue.dx || scrollQueue.dy) flushScroll();
+  // Drop the carried wheel remainder between gestures (a tiny leftover from
+  // one swipe must not nudge the next one), but keep the queue ready: the
+  // next desktop wheel event has no pointer to wait for.
   scrollQueue.needReset = true;
-  scrollQueue.resetSent = false;
+  scrollQueue.resetSent = true;
 }
 viewport.addEventListener('pointerdown', onPointerDown, {passive: false});
 viewport.addEventListener('pointermove', onPointerMove, {passive: false});
@@ -449,8 +488,11 @@ viewport.addEventListener('wheel', function(e){
     return;
   }
   var unit = e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? vpH() : 1);
-  queueScroll(-e.deltaX * unit / zoom, -e.deltaY * unit / zoom,
-              ratioAt(e.clientX, e.clientY));
+  var desktop = screenW / Math.max(1, frameW);
+  // A desktop mouse wheel also decides where the wheel goes: park the
+  // pointer under the cursor once, then turn the wheel.
+  parkPointer(ratioAt(e.clientX, e.clientY));
+  queueScroll(-e.deltaX * unit * desktop / zoom, -e.deltaY * unit * desktop / zoom);
   flushScroll();
 }, {passive: false});
 
@@ -567,6 +609,9 @@ function applySize(w, h){
   ctx.fillRect(0, 0, w, h);
   haveSize = true;
   pictureReady = false;
+  // A change of picture size (HD Auto/High/Low) changes the fit.
+  computeFit();
+  if (zoom <= fitScale * 1.02) fitView(); else { clampPan(); applyView(); }
 }
 // Decode a tile. createImageBitmap is fastest; older Safari only has Image.
 function decodeBlob(blob){

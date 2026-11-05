@@ -27,7 +27,9 @@ Sending `livestream` (or `live`) starts **two separate listeners and two separat
 - `stop stream` — close both public tunnels and stop PhoneFS and its child `cloudflared` process.
 - Repeating `livestream` reuses running services. If PhoneFS failed or was stopped from its browser UI, it starts a fresh PhoneFS session without interrupting a working screen tunnel.
 - PhoneFS setup runs in the background. A PhoneFS error is reported in Telegram and does not stop screen sharing. Startup failures are retried, including HTTP/2 fallback if QUIC is blocked.
-- A quick tunnel can briefly return `502` while connecting; wait a few seconds and refresh. Both links are temporary and disappear when the workflow ends (maximum six hours).
+- **The screen link is verified before it is sent.** cloudflared prints a quick-tunnel hostname before Cloudflare can route to it, which used to leave the chat with a link that opened a `502` or a stuck page. The runner now fetches the public URL itself, waits until it really serves this viewer (a marker rendered by the screen server), and only then sends it. If it never answers, a fresh tunnel is opened instead of a dead link.
+- **A link that dies later is replaced automatically.** Once online, the public link is re-checked every ~45 s; after four failed checks in a row the tunnel is replaced, and the chat gets the new link. `livestream status` shows `Public link from the internet: reachable / NOT reachable right now`, which separates "cloudflared is running" from "the phone can actually open it". Each launch failure is reported the first three times per session (and always logged), so a failing loop no longer floods the chat.
+- Quick tunnels can still take a few seconds to become reachable; the viewer reconnects by itself, and a refresh always helps. Both links are temporary and disappear when the workflow ends (maximum six hours).
 
 The workflow pre-downloads the exact fixed Windows package from its public [Google Drive link](https://drive.google.com/file/d/11ZqoB5wQ0C0Ajj8MMCydDnD3OC_GEGKS/view?usp=drivesdk) (file id `11ZqoB5wQ0C0Ajj8MMCydDnD3OC_GEGKS`); the old GitHub copy was removed, so the download no longer uses `raw.githubusercontent.com`. The shared file is the generated single-file agent itself (`phonefs_win_FIXED.py`, produced by `make_bundle.py`); a ZIP containing that same agent is still accepted too. `.github/phonefs_service.py` verifies the package's SHA-256, uses **`phonefs_win_FIXED.py`** directly (never the setup BAT, which expects a different filename and can fall back to an older download), and confirms a bare script really is the agent before installing it. The download follows Google Drive's one-time confirmation page for large/scanned files (a second Drive host is tried as a mirror). Downloads and per-session config live under the runner's temporary directory, not in Git. PhoneFS needs no extra Python dependencies; it reuses the workflow's Python and `cloudflared`.
 
@@ -59,7 +61,7 @@ Passwords are generated with `secrets`, configured over stdin (not command-line 
 
 The **Swipe: Scroll / Pan** toolbar button switches the one-finger gesture between scrolling the VM and panning a zoomed view (handy when the desktop is zoomed in). **🔍− / 🔍+ / Fit / 1:1** set the zoom without pinching, and the **HD** button (Auto/High/Low) decides how much screen resolution the live picture uses — Auto asks for more pixels while you are zoomed in and less when you are zoomed out.
 
-A swipe is translated by the server into real wheel notches (with a carried remainder, so slow and fast swipes move the same distance), which is why it can no longer select text or drag a window. Before each notch the pointer is moved under your finger, because a wheel message goes to the window under the mouse — that is what makes scrolling land in the right place. Pinch zoom happens in the browser, so it stays instant; use `zoom in` / `zoom out` / `zoom 150` / `zoom reset` if you want the VM's own desktop zoom changed instead.
+A swipe is translated by the server into real wheel notches (with a carried remainder, so slow and fast swipes move the same distance), which is why it can no longer select text or drag a window. A wheel message goes to the window under the mouse, so the pointer is **parked under your finger once, when the touch starts**, and never moves again during that gesture — a previous build moved it on every scroll request, which made the pointer visibly race up and down the screen while swiping. One finger pixel is one *desktop* pixel (the picture is smaller than the desktop), so a swipe scrolls as far as the finger travels. Pinch zoom happens in the browser, so it stays instant; use `zoom in` / `zoom out` / `zoom 150` / `zoom reset` if you want the VM's own desktop zoom changed instead.
 
 #### Bandwidth: only what changed is sent
 
@@ -83,6 +85,12 @@ python tools/preview_desktop.py --port 8000
 ```
 
 This serves the real viewer against a drawn fake desktop, so swiping, pinching, tapping and wheel scrolling can be tried in a browser before running the workflow.
+
+```sh
+node tools/simulate_swipe.js          # what a phone swipe actually sends
+```
+
+That drives the real `desktop_client.html` script in Node with a fake DOM and a virtual clock, reproduces a 240 px one-finger swipe on a 390x780 phone view, and prints every request the viewer made: it must be exactly **one** pointer park (on touch-down, no `x_ratio` on the wheel requests afterwards), the wheel sum must equal the finger travel (factor 1.000), and no click/drag may be produced.
 
 ### 📁 File Manager (Telegram)
 - `pwd`, `ls [path]`, `cat <file>`, `get <file>` (sends file), `mkdir`, `rm`, `mv <src> <dst>`, `cp <src> <dst>`, `write <file> <text>`, `append <file> <text>`, `find <pattern>`, `tree`, `du`, `zip`, `unzip`, `wget <url>`, `cd <path>`
@@ -139,7 +147,7 @@ python -m pip install requests
 python -m unittest discover -s tests -v
 ```
 
-The tests do not need a Telegram token or a public tunnel. They cover the pinned installer, checksum rejection, port fallback, private credential delivery, startup login verification, idempotent starts, fresh passwords on restart, stop/cancellation cleanup, and Telegram command routing. `tests/test_desktop_gestures.py` additionally pins the viewer's gestures: a swipe must produce wheel events and never press a mouse button, pixel deltas must survive as wheel notches, pinch zoom must be client side, and the desktop `zoom` command must step through Ctrl+plus/minus. Run the updated workflow on Windows for the final live Telegram/Cloudflare check.
+The tests do not need a Telegram token or a public tunnel. They cover the pinned installer, checksum rejection, port fallback, private credential delivery, startup login verification, idempotent starts, fresh passwords on restart, stop/cancellation cleanup, and Telegram command routing. They also pin the tunnel lifecycle: an announced link must have answered the public probe first (`HTTP 502`, a dropped connection or another app's answer all count as unreachable), an unreachable link is never announced, and a link that stops answering is replaced with a new one. `tests/test_desktop_gestures.py` additionally pins the viewer's gestures: a swipe must produce wheel events and never press a mouse button, pixel deltas must survive as wheel notches, pinch zoom must be client side, and the desktop `zoom` command must step through Ctrl+plus/minus. Run the updated workflow on Windows for the final live Telegram/Cloudflare check.
 
 ---
 

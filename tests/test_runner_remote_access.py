@@ -120,13 +120,8 @@ class RemoteAccessTests(unittest.TestCase):
         self.assertIn("PhoneFS status with dummy credentials", text)
         self.assertIsNone(self.send.call_args.kwargs["parse_mode"])
 
-    def test_screen_url_from_merged_stderr_is_announced_with_phonefs_status(self):
-        event = runner.livestream_stop_event = threading.Event()
-        runner.livestream_chat_id = 42
-        process = mock.Mock(pid=12345)
-        process.stdout = io.StringIO("\x1b[32m| https://screen-test.trycloudflare.com |\x1b[0m\n")
-        process.poll.return_value = None
-
+    def _supervisor(self, event, process, probe=True):
+        """Run one supervisor turn; stop as soon as the chat has the link."""
         def notified(chat_id, text, **kwargs):
             if text.startswith("Screen sharing online"):
                 event.set()
@@ -136,16 +131,93 @@ class RemoteAccessTests(unittest.TestCase):
         with mock.patch.object(runner, "_is_port_open", return_value=True), \
              mock.patch.object(runner, "_find_cloudflared", return_value="cloudflared"), \
              mock.patch.object(runner.subprocess, "Popen", return_value=process) as launch, \
+             mock.patch.object(runner, "_tunnel_probe", return_value=probe) as probe_call, \
              mock.patch.object(runner, "terminate_process_tree"), redirect_stdout(captured):
             runner.run_tunnel_with_autorestart(42, event)
+        return launch, probe_call, captured
+
+    def test_screen_url_is_announced_only_after_the_public_link_answers(self):
+        event = runner.livestream_stop_event = threading.Event()
+        runner.livestream_chat_id = 42
+        process = mock.Mock(pid=12345)
+        process.stdout = io.StringIO("\x1b[32m| https://screen-test.trycloudflare.com |\x1b[0m\n")
+        process.poll.return_value = None
+
+        launch, probe, captured = self._supervisor(event, process)
         self.assertEqual(launch.call_args.args[0],
                          ["cloudflared", "tunnel", "--url", "http://127.0.0.1:5000"])
         self.assertEqual(launch.call_args.kwargs["stderr"], subprocess.STDOUT)
+        # The announced link was verified through the public hostname first.
+        self.assertGreaterEqual(probe.call_count, 1)
+        self.assertEqual(probe.call_args_list[0], mock.call("https://screen-test.trycloudflare.com"))
         message = self.send.call_args.args[1]
         self.assertIn("https://screen-test.trycloudflare.com", message)
         self.assertIn("PhoneFS status with dummy credentials", message)
         self.assertNotIn("dummy credentials", captured.getvalue())
         self.assertNotIn("https://screen-test.trycloudflare.com", captured.getvalue())
+
+    def test_unreachable_link_is_never_announced_and_the_tunnel_is_replaced(self):
+        # A quick tunnel whose hostname answers 502/the edge drops TLS looks
+        # exactly like this: a printed URL that never works.
+        event = runner.livestream_stop_event = threading.Event()
+        runner.livestream_chat_id = 42
+        process = mock.Mock(pid=12345)
+        process.stdout = io.StringIO("https://dead-link.trycloudflare.com\n")
+        process.poll.return_value = None
+
+        def no_answer(url, timeout=None):
+            event.set()      # stop after the first failed verification
+            return False
+
+        self.send.side_effect = lambda chat_id, text, **kw: None
+        with mock.patch.object(runner, "_is_port_open", return_value=True), \
+             mock.patch.object(runner, "_find_cloudflared", return_value="cloudflared"), \
+             mock.patch.object(runner.subprocess, "Popen", return_value=process), \
+             mock.patch.object(runner, "_tunnel_probe", side_effect=no_answer) as probe, \
+             mock.patch.object(runner, "terminate_process_tree"), \
+             redirect_stdout(io.StringIO()):
+            runner.run_tunnel_with_autorestart(42, event)
+        self.assertEqual(probe.call_count, 1)
+        self.assertFalse(runner.livestream_url)
+        for call in self.send.call_args_list:
+            self.assertNotIn("Screen sharing online", call.args[1])
+            self.assertNotIn("https://dead-link.trycloudflare.com", call.args[1])
+
+    def test_a_link_that_stops_answering_is_replaced_with_a_new_one(self):
+        event = runner.livestream_stop_event = threading.Event()
+        runner.livestream_chat_id = 42
+        first, second = mock.Mock(pid=1), mock.Mock(pid=2)
+        first.stdout = io.StringIO("https://first-link.trycloudflare.com\n")
+        second.stdout = io.StringIO("https://second-link.trycloudflare.com\n")
+        for process in (first, second):
+            process.poll.return_value = None
+        answers = {"https://first-link.trycloudflare.com": [True] + [False] * 4,
+                   "https://second-link.trycloudflare.com": [True]}
+
+        def probe(url, timeout=None):
+            queue = answers[url]
+            return queue.pop(0) if queue else True
+
+        def notified(chat_id, text, **kwargs):
+            if "https://second-link.trycloudflare.com" in text:
+                event.set()
+        self.send.side_effect = notified
+
+        with mock.patch.object(runner, "_is_port_open", return_value=True), \
+             mock.patch.object(runner, "_find_cloudflared", return_value="cloudflared"), \
+             mock.patch.object(runner.subprocess, "Popen", side_effect=[first, second]), \
+             mock.patch.object(runner, "_tunnel_probe", side_effect=probe), \
+             mock.patch.object(runner, "terminate_process_tree") as terminate, \
+             mock.patch.object(runner, "TUNNEL_HEALTH_INTERVAL", 0), \
+             mock.patch.object(runner, "TUNNEL_READY_INTERVAL", 0), \
+             redirect_stdout(io.StringIO()):
+            runner.run_tunnel_with_autorestart(42, event)
+        announced = [call.args[1] for call in self.send.call_args_list
+                     if "Screen sharing online" in call.args[1]]
+        self.assertEqual(len(announced), 2)
+        self.assertIn("https://first-link.trycloudflare.com", announced[0])
+        self.assertIn("https://second-link.trycloudflare.com", announced[1])
+        terminate.assert_called()
 
     def test_stale_screen_supervisor_cannot_overwrite_new_session(self):
         old = threading.Event()
@@ -243,6 +315,44 @@ class RemoteAccessTests(unittest.TestCase):
         status.assert_not_called()
         command.assert_not_called()
         download.assert_not_called()
+
+
+class TunnelProbeTests(unittest.TestCase):
+    def reply(self, status, text):
+        response = mock.Mock(status_code=status, text=text)
+        return response
+
+    def test_only_this_viewer_counts_as_reachable(self):
+        with mock.patch.object(runner.requests, "get",
+                               return_value=self.reply(200, "<html><!--GitHub-VM-Remote-Desktop 1--></html>")):
+            self.assertEqual(runner._probe_screen_url("https://ok.trycloudflare.com"),
+                             (True, "reachable"))
+
+    def test_cloudflare_error_pages_are_reported_with_their_status(self):
+        with mock.patch.object(runner.requests, "get", return_value=self.reply(502, "bad gateway")):
+            self.assertEqual(runner._probe_screen_url("https://half.trycloudflare.com"),
+                             (False, "HTTP 502"))
+        with mock.patch.object(runner.requests, "get", return_value=self.reply(200, "some other app")):
+            self.assertFalse(runner._probe_screen_url("https://other.trycloudflare.com")[0])
+
+    def test_a_dropped_connection_is_not_treated_as_reachable(self):
+        with mock.patch.object(runner.requests, "get", side_effect=ConnectionError("reset")):
+            ok, why = runner._probe_screen_url("https://gone.trycloudflare.com")
+        self.assertFalse(ok)
+        self.assertIn("ConnectionError", why)
+
+    def test_status_shows_whether_the_link_works_from_the_internet(self):
+        runner.livestream_chat_id = 42
+        runner.livestream_active = True
+        runner.livestream_url = "https://screen-test.trycloudflare.com"
+        send = mock.Mock()
+        with mock.patch.object(runner, "send_message", send), \
+             mock.patch.object(runner, "phonefs_service", mock.Mock(status_text=mock.Mock(return_value="PhoneFS"))), \
+             mock.patch.object(runner, "_is_port_open", return_value=True), \
+             mock.patch.object(runner, "_tunnel_probe", return_value=False):
+            runner.livestream_status(42)
+        text = send.call_args.args[1]
+        self.assertIn("Public link from the internet: NOT reachable right now", text)
 
 
 class TelegramMessageTests(unittest.TestCase):
